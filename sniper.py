@@ -133,24 +133,8 @@ class Sniper:
             time.sleep(0.5)
             buy_price = self.client.get_buy_price(token, a.max_token_price, a.min_token_price)
 
-        # DRY RUN fallback: estimate price from delta (observed pricing model)
-        if buy_price <= 0 and self.dry_run:
-            ad = abs(sig.delta_pct)
-            if ad >= 0.15:
-                buy_price = 0.93
-            elif ad >= 0.10:
-                buy_price = 0.80
-            elif ad >= 0.05:
-                buy_price = 0.65
-            elif ad >= 0.02:
-                buy_price = 0.55
-            else:
-                buy_price = 0.50
-            print(f"  [{a.name}] [DRY] Estimated price: {buy_price:.2f}"
-                  f" (delta={sig.delta_pct:+.3f}%)")
-
         if buy_price <= 0:
-            print(f"  [{a.name}] [SKIP] No valid price for {sig.direction}")
+            print(f"  [{a.name}] [SKIP] No executable ask for {sig.direction}")
             self.stats.skipped += 1
             return  # NOT setting s.fired — can retry this window
 
@@ -182,7 +166,7 @@ class Sniper:
 
         if self.dry_run:
             s.order_id = f"DRY-{a.name}-{sig.direction}-{s.window_ts}"
-            print(f"  [{a.name}] [DRY] Would MAKER BUY {sig.direction}")
+            print(f"  [{a.name}] [DRY] Would TAKER BUY {sig.direction}")
             self.stats.fired += 1
         else:
             s.order_id = self.client.submit_maker_buy(
@@ -245,13 +229,13 @@ class Sniper:
         if not s.fire_side:
             return
 
-        # Determine result from POLYMARKET token prices (actual resolution source)
-        # After resolution: winning token → midpoint ~$0.95-1.00, losing → ~$0.00-0.05
+        # Determine result from token prices first.
+        # If token prices are unavailable, fall back to the reference spot proxy.
         up_mid = self.client.fetch_midpoint(s.up_token)
         down_mid = self.client.fetch_midpoint(s.down_token)
 
         if up_mid > 0.01 or down_mid > 0.01:
-            # Use token prices to determine actual outcome
+            # Use token prices to infer outcome
             if up_mid > down_mid:
                 actual = "UP"
             elif down_mid > up_mid:
@@ -260,7 +244,7 @@ class Sniper:
                 actual = ""
             won = (s.fire_side == actual) if actual else False
         else:
-            # Fallback: Binance price (less reliable)
+            # Fallback: reference spot proxy (less reliable)
             close_price = self.client.fetch_price(a.binance_symbol)
             gap = close_price - s.open_price if close_price > 0 else 0
             actual = "UP" if gap >= 0 else "DOWN"
@@ -398,17 +382,13 @@ class Sniper:
                 if now - last_tick >= 2.0:
                     last_tick = now
                     token = s.up_token if s.fire_side == "UP" else s.down_token
-                    cur_token = self.client.fetch_midpoint(token)
-                    if cur_token > 0.01:
-                        gain = cur_token - s.fire_price
-                        print(f"  [{a.name}] 📊 {s.fire_side} token"
-                              f" ${cur_token:.2f} (gain={gain:+.2f})"
+                    sell_price = self.client.get_sell_price(token)
+                    if sell_price > 0.01:
+                        gain = sell_price - s.fire_price
+                        print(f"  [{a.name}] 📊 {s.fire_side} bid"
+                              f" ${sell_price:.2f} (gain={gain:+.2f})"
                               f" T-{sl:.0f}s", end="\r")
                         if gain >= 0.10:
-                            # Продаём по best_bid — гарантированный fill
-                            sell_price = self.client.get_sell_price(token)
-                            if sell_price <= s.fire_price:
-                                sell_price = round(cur_token - 0.01, 2)  # fallback
                             actual_gain = sell_price - s.fire_price
                             profit = round(s.fire_shares * actual_gain * 0.98, 2)
                             print(f"\n  [{a.name}] 💰 EARLY EXIT: sell"
