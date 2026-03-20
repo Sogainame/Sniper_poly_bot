@@ -38,9 +38,12 @@ BTC = AssetConfig(
     min_confidence=0.30,
     max_token_price=0.82,
     min_token_price=0.52,
-    eval_start_secs=180,
-    eval_end_secs=30,
+    eval_start_secs=60,         # was 180 — T-170s entry caused 4/4 losses (reversals)
+    eval_end_secs=20,           # was 30 — give 20s for order to fill before close
     priority=1,
+    # Math: at T-60s, Δ=0.03% gives P(hold)=69% vs 58% at T-170s
+    # 4 minutes of price action filters noise from signal
+    # MM hasn't fully repriced yet → edge preserved
 )
 
 SOL = AssetConfig(
