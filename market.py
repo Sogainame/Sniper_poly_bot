@@ -73,26 +73,30 @@ class PolymarketClient:
             except Exception:
                 pass
 
-        # Method 3: Direct USDC balance on Polygon via public RPC
+        # Method 3: Direct on-chain balance check via Polygon RPC
+        # Polymarket uses USDC.e (bridged) on Polygon, not native USDC
         if funder:
-            try:
-                usdc_contract = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-                # balanceOf(address) selector = 0x70a08231
-                data_hex = "0x70a08231" + funder.lower().replace("0x", "").zfill(64)
-                r = self.http.post(
-                    "https://polygon-rpc.com",
-                    json={"jsonrpc": "2.0", "method": "eth_call", "id": 1,
-                          "params": [{"to": usdc_contract, "data": data_hex}, "latest"]},
-                    timeout=10.0,
-                )
-                if r.status_code == 200:
-                    result = r.json().get("result", "0x0")
-                    raw = int(result, 16)
-                    bal = raw / 1e6
-                    if bal > 0.01:
-                        return bal
-            except Exception:
-                pass
+            usdc_contracts = [
+                ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "USDC.e", 6),
+                ("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", "USDC", 6),
+            ]
+            for contract, label, decimals in usdc_contracts:
+                try:
+                    data_hex = "0x70a08231" + funder.lower().replace("0x", "").zfill(64)
+                    r = self.http.post(
+                        "https://polygon-rpc.com",
+                        json={"jsonrpc": "2.0", "method": "eth_call", "id": 1,
+                              "params": [{"to": contract, "data": data_hex}, "latest"]},
+                        timeout=10.0,
+                    )
+                    if r.status_code == 200:
+                        result = r.json().get("result", "0x0")
+                        raw = int(result, 16)
+                        bal = raw / (10 ** decimals)
+                        if bal > 0.01:
+                            return bal
+                except Exception:
+                    pass
 
         return None
 
