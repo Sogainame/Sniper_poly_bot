@@ -244,7 +244,14 @@ class Sniper:
         if edge >= MIN_EDGE_STRONG:
             bet = min(bet * 1.5, self.max_bet)
 
+        # ── Liquidity cap: don't order more shares than available ──────
+        book = self.client.fetch_book(token)
+        ask_depth = book.get("ask_depth", 0)
         shares = max(bet / buy_price, 5)  # Polymarket min 5 shares
+        if ask_depth > 0 and shares > ask_depth * 0.8:
+            shares = max(ask_depth * 0.8, 5)
+            print(f"  [{a.name}] [LIQ CAP] {shares:.0f}sh (depth={ask_depth:.0f})")
+
         cost = shares * buy_price
         roi = ((1.0 - buy_price) / buy_price) * 100
         sl = self._secs_left()
@@ -315,6 +322,12 @@ class Sniper:
         if not s.fire_side:
             return
 
+        # If LIVE and no order_id → FOK was rejected/failed, no fill
+        if not self.dry_run and not s.order_id:
+            print(f"  [{a.name}] [NO FILL] FOK rejected — no P&L")
+            self.stats.skipped += 1
+            return
+
         close_price = self.client.fetch_price(a.binance_symbol)
         gap = close_price - s.open_price if close_price > 0 else 0
 
@@ -326,7 +339,7 @@ class Sniper:
             won = self.client.fetch_midpoint(token) >= 0.70
 
         if won:
-            profit = round(s.fire_shares * (1.0 - s.fire_price) * 0.98, 2)
+            profit = round(s.fire_shares * (1.0 - s.fire_price) * 0.985, 2)  # 1.5% taker fee
             self.stats.wins += 1
             self.stats.pnl += profit
             result = "WIN"

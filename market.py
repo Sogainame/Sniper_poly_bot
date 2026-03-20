@@ -139,13 +139,16 @@ class PolymarketClient:
                 book = r.json()
                 bids = book.get("bids", [])
                 asks = book.get("asks", [])
+                # Sum available shares on ask side (liquidity depth)
+                ask_depth = sum(float(a.get("size", 0)) for a in asks[:5])
                 return {
                     "best_bid": float(bids[0]["price"]) if bids else 0.0,
                     "best_ask": float(asks[0]["price"]) if asks else 0.0,
+                    "ask_depth": ask_depth,
                 }
         except Exception:
             pass
-        return {"best_bid": 0.0, "best_ask": 0.0}
+        return {"best_bid": 0.0, "best_ask": 0.0, "ask_depth": 0.0}
 
     def get_buy_price(self, token_id: str, max_price: float, min_price: float) -> float:
         """Get the price we'd actually pay. For FOK = best ask. Fallback to midpoint."""
