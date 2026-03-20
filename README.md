@@ -1,78 +1,85 @@
 # Sniper Poly Bot
 
-Multi-asset 5-minute market sniper for Polymarket BTC/ETH/SOL/XRP/DOGE Up/Down markets.
+Бот для 5-минутных BTC Up/Down рынков на Polymarket.
 
-## Strategy
+## Как работает
 
-Based on research of real trading results and open-source bots:
+1. Каждые 5 минут Polymarket открывает рынок: "BTC вырастет или упадёт?"
+2. Бот ждёт до последней минуты (T-60 → T-20 секунд до конца)
+3. Анализирует направление BTC по delta + momentum + tick consistency
+4. Покупает UP или DOWN токен по $0.50-0.82
+5. Если токен вырос на +$0.10 до закрытия — продаёт досрочно (фиксирует прибыль)
+6. Если выиграл и не продал — Polymarket автоматически возвращает $1.00 за токен
+7. Если проиграл — потерял стоимость токена
 
-- **Composite signal engine**: window delta (weight 6) + micro momentum (2) + acceleration (1.5) + tick consistency (1.5)
-- **Maker GTC orders**: 0% taker fee + maker rebates
-- **Kelly criterion**: position sizing based on edge and confidence
-- **Per-asset tuning**: each coin has individual delta/confidence thresholds based on observed volatility and liquidity
-- **Eval window**: BTC T-60→T-20, others T-150..170→T-30
-- **Result check**: Polymarket token midpoints (Chainlink resolution source), not Binance
-- **Early exit**: sells position if token price rises +$0.10 before window closes
-
-## Asset Profiles
-
-| Asset | Priority | Min Delta | Min Confidence | Binance Symbol | Notes |
-|-------|----------|-----------|----------------|----------------|-------|
-| BTC   | ⭐⭐⭐   | 0.02%     | 30%            | BTCUSDT        | Best liquidity, most bots |
-| SOL   | ⭐⭐     | 0.03%     | 35%            | SOLUSDT        | Good, more volatile |
-| ETH   | ⭐       | 0.04%     | 45%            | ETHUSDT        | Noisy, higher threshold |
-| XRP   | ⚠️       | 0.05%     | 50%            | XRPUSDT        | Jerky moves, careful |
-| DOGE  | ⚠️       | 0.08%     | 55%            | DOGEUSDT       | Meme, thin liquidity |
-
-## Usage
+## Быстрый старт
 
 ```bash
-# Single asset - DRY RUN
-python bot.py --asset btc
-python bot.py --asset sol
-python bot.py --asset eth
-
-# Single asset - LIVE
-python bot.py --asset btc --live
-python bot.py --asset btc --live --mode aggressive
-
-# Multi-asset - run all configured assets
-python bot.py --asset all
-
-# Options
-python bot.py --asset btc --live --mode degen --max-bet 20
-```
-
-## Modes
-
-- `safe` — Quarter Kelly, max 25% of balance per trade
-- `aggressive` — Half Kelly, max 50% of balance per trade  
-- `degen` — Full Kelly, 100% of balance per trade
-
-## Setup
-
-```bash
+# 1. Установка
+git clone https://github.com/Sogainame/Sniper_poly_bot.git
+cd Sniper_poly_bot
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+
+# 2. Настройка
 cp .env.example .env
-# Edit .env with your keys
+nano .env
+
+# 3. Разрешения (один раз, нужен POL на кошельке для газа)
+python set_allowances.py
+
+# 4. Проверить состояние
+python status.py
+
+# 5. Запуск
+python bot.py --asset btc --live --mode safe
 ```
 
-## Files
+## Скрипты
+
+| Файл | Что делает | Когда запускать |
+|------|-----------|-----------------|
+| `bot.py` | Основной бот — торгует | Постоянно |
+| `status.py` | Баланс, позиции, история сделок | Когда хочешь посмотреть состояние |
+| `set_allowances.py` | Разрешения на продажу токенов | Один раз после депозита POL |
+| `check_balance.py` | Проверка баланса USDC | Для отладки |
+
+## Режимы
+
+```bash
+python bot.py --asset btc --live --mode safe        # Осторожный (25% Kelly)
+python bot.py --asset btc --live --mode aggressive   # Агрессивный (50% Kelly)
+python bot.py --asset btc --live --mode degen         # На всё (100% Kelly)
+python bot.py --asset btc                             # Тест без денег
+```
+
+## Настройки BTC
+
+| Параметр | Значение | Зачем |
+|----------|----------|-------|
+| Eval window | T-60 → T-20 | Вход в последнюю минуту |
+| Min delta | 0.02% | Минимальное движение BTC |
+| Max token | $0.82 | Не покупать дороже |
+| Early exit | +$0.10 | Продать при росте токена на 10 центов |
+
+## Файлы
 
 ```
-├── bot.py              # Entry point + CLI
-├── sniper.py           # Core sniper engine (asset-agnostic)
-├── signal_engine.py    # Composite signal analysis
-├── assets.py           # Per-asset configs (thresholds, symbols)
-├── market.py           # Polymarket API (market lookup, orders, prices)
-├── notifier.py         # Telegram notifications
-├── config.py           # Env loader
-├── requirements.txt
-├── .env.example
-└── data/sniper/        # CSV trade logs per asset
+bot.py              — Точка входа, CLI
+sniper.py           — Ядро: цикл → сигнал → покупка → отслеживание → результат
+signal_engine.py    — Анализ: delta + momentum + acceleration + consistency
+assets.py           — Настройки по активам
+market.py           — Polymarket API: цены, ордера, ордербук
+notifier.py         — Telegram уведомления
+config.py           — Загрузка .env
+status.py           — Панель состояния
+set_allowances.py   — Одноразовые разрешения
+check_balance.py    — Отладка баланса
+data/sniper/        — CSV логи сделок
 ```
 
-## Environment Variables
+## .env
 
 ```
 POLY_PRIVATE_KEY=0x...
@@ -80,3 +87,8 @@ POLY_FUNDER_ADDRESS=0x...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 ```
+
+## VPS
+
+Лучший вариант: Дублин, Ирландия (0.83ms до Polymarket).
+Серверы Polymarket в Лондоне, Дублин — ближайшая незаблокированная страна.
