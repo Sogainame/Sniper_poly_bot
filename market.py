@@ -44,7 +44,7 @@ class PolymarketClient:
     # ── Balance ───────────────────────────────────────────────────────────
 
     def get_balance(self) -> float | None:
-        # Method 1: CLOB API
+        # Method 1: CLOB client library
         try:
             resp = self.clob.get_balance_allowance()
             if isinstance(resp, dict):
@@ -55,7 +55,28 @@ class PolymarketClient:
         except Exception:
             pass
 
-        # Method 2: Polymarket data API
+        # Method 2: Direct CLOB REST API (bypasses broken client method)
+        try:
+            creds = self.clob.get_api_creds()
+            if creds:
+                headers = {
+                    "POLY_API_KEY": creds.get("apiKey", ""),
+                    "POLY_API_SECRET": creds.get("secret", ""),
+                    "POLY_PASSPHRASE": creds.get("passphrase", ""),
+                }
+                r = self.http.get(f"{CLOB_HOST}/balance-allowance",
+                                  headers=headers, timeout=10.0)
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, dict):
+                        raw = float(data.get("balance", 0) or 0)
+                        bal = raw / 1e6 if raw > 10_000 else raw
+                        if bal > 0.01:
+                            return bal
+        except Exception:
+            pass
+
+        # Method 3: Polymarket data API
         funder = config.POLY_FUNDER_ADDRESS
         if funder:
             try:
@@ -65,7 +86,7 @@ class PolymarketClient:
                     data = r.json()
                     entries = data if isinstance(data, list) else [data]
                     for entry in entries:
-                        for key in ("portfolioValue", "value", "cashBalance", "balance"):
+                        for key in ("cashBalance", "balance", "portfolioValue", "value"):
                             if key in entry:
                                 v = float(entry[key])
                                 if v > 0.01:
@@ -73,14 +94,13 @@ class PolymarketClient:
             except Exception:
                 pass
 
-        # Method 3: Direct on-chain balance check via Polygon RPC
-        # Polymarket uses USDC.e (bridged) on Polygon, not native USDC
+        # Method 4: Direct on-chain USDC check
         if funder:
             usdc_contracts = [
-                ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "USDC.e", 6),
-                ("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", "USDC", 6),
+                ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", 6),
+                ("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6),
             ]
-            for contract, label, decimals in usdc_contracts:
+            for contract, decimals in usdc_contracts:
                 try:
                     data_hex = "0x70a08231" + funder.lower().replace("0x", "").zfill(64)
                     r = self.http.post(

@@ -38,6 +38,24 @@ try:
 except Exception as e:
     print(f"  Error: {e}")
 
+    # Try direct REST call with derived creds
+    print("  Trying direct REST...")
+    try:
+        creds = client.get_api_creds()
+        print(f"  Creds available: {bool(creds)}")
+        if creds:
+            headers = {
+                "POLY_API_KEY": creds.get("apiKey", ""),
+                "POLY_API_SECRET": creds.get("secret", ""),
+                "POLY_PASSPHRASE": creds.get("passphrase", ""),
+            }
+            r = http.get("https://clob.polymarket.com/balance-allowance",
+                         headers=headers, timeout=10.0)
+            print(f"  REST Status: {r.status_code}")
+            print(f"  REST Response: {r.text[:300]}")
+    except Exception as e2:
+        print(f"  REST Error: {e2}")
+
 print()
 
 # 3. Direct on-chain USDC
