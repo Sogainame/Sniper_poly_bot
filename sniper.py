@@ -431,14 +431,16 @@ class Sniper:
                             s.best_signal = sig
 
                         # Fetch LIVE token price to compute real edge
+                        # Use get_buy_price (best_ask) — same as _fire() uses
                         edge_str = ""
                         live_edge = 0.0
                         if sig.direction and len(self.engine.tick_prices) >= 3:
                             token_id = s.up_token if sig.direction == "UP" else s.down_token
-                            token_price = self.client.fetch_midpoint(token_id)
+                            token_price = self.client.get_buy_price(
+                                token_id, a.max_token_price, a.min_token_price)
                             if token_price > 0.01:
                                 live_edge = sig.true_prob - token_price
-                                edge_str = f" E={live_edge:+.0%}"
+                                edge_str = f" E={live_edge:+.0%} ask={token_price:.2f}"
 
                                 # Track best edge seen
                                 if live_edge > s.best_edge:
