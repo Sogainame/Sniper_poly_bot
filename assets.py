@@ -36,10 +36,10 @@ BTC = AssetConfig(
     chainlink_symbol="btc/usd",
     min_delta_pct=0.02,
     min_confidence=0.30,
-    max_token_price=0.93,
+    max_token_price=0.82,
     min_token_price=0.52,
-    eval_start_secs=60,
-    eval_end_secs=10,
+    eval_start_secs=180,
+    eval_end_secs=30,
     priority=1,
 )
 
@@ -50,10 +50,10 @@ SOL = AssetConfig(
     chainlink_symbol="sol/usd",
     min_delta_pct=0.03,
     min_confidence=0.35,
-    max_token_price=0.92,
+    max_token_price=0.80,
     min_token_price=0.52,
-    eval_start_secs=55,
-    eval_end_secs=10,
+    eval_start_secs=170,
+    eval_end_secs=30,
     priority=2,
 )
 
@@ -64,10 +64,10 @@ ETH = AssetConfig(
     chainlink_symbol="eth/usd",
     min_delta_pct=0.04,
     min_confidence=0.45,
-    max_token_price=0.91,
+    max_token_price=0.78,
     min_token_price=0.53,
-    eval_start_secs=50,
-    eval_end_secs=10,
+    eval_start_secs=160,
+    eval_end_secs=30,
     priority=3,
 )
 
@@ -78,10 +78,10 @@ XRP = AssetConfig(
     chainlink_symbol="xrp/usd",
     min_delta_pct=0.05,
     min_confidence=0.50,
-    max_token_price=0.90,
+    max_token_price=0.78,
     min_token_price=0.53,
-    eval_start_secs=50,
-    eval_end_secs=12,
+    eval_start_secs=160,
+    eval_end_secs=30,
     priority=4,
 )
 
@@ -92,10 +92,10 @@ DOGE = AssetConfig(
     chainlink_symbol="doge/usd",
     min_delta_pct=0.08,
     min_confidence=0.55,
-    max_token_price=0.88,
+    max_token_price=0.76,
     min_token_price=0.54,
-    eval_start_secs=45,
-    eval_end_secs=12,
+    eval_start_secs=150,
+    eval_end_secs=30,
     priority=5,
 )
 
