@@ -189,6 +189,10 @@ class Sniper:
                 token, buy_price, shares, f"{a.name}-{sig.direction}")
             if s.order_id:
                 self.stats.fired += 1
+                # Show real balance after order
+                bal = self.client.get_balance()
+                if bal is not None:
+                    print(f"  [{a.name}]    💰 Balance: ${bal:.2f}")
             else:
                 print(f"  [{a.name}] [!] Order failed — unfiring window")
                 s.fired = False
@@ -267,15 +271,17 @@ class Sniper:
             self.stats.wins += 1
             self.stats.pnl += profit
             result = "WIN"
-            print(f"  [{a.name}] ✅ WIN: {s.fire_side} → +${profit:.2f}"
-                  f" | {a.name}: ${close_price:,.4f} ({gap:+,.4f})")
+            print(f"  [{a.name}] ✅ WIN: {s.fire_side}"
+                  f" | bought {s.fire_shares:.0f}sh @ ${s.fire_price:.2f}"
+                  f" → payout ${s.fire_shares:.0f} × $1.00 = +${profit:.2f}")
+            print(f"  [{a.name}]    UP=${up_mid:.2f} DOWN=${down_mid:.2f}"
+                  f" → resolved: {actual}")
 
             # Auto-sell winning tokens at $0.99 to recycle back to USDC
             if not self.dry_run:
                 token = s.up_token if s.fire_side == "UP" else s.down_token
-                time.sleep(3)  # wait for settlement
+                time.sleep(3)
 
-                # Update conditional token allowance before sell
                 try:
                     from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
                     self.client.clob.update_balance_allowance(
@@ -288,20 +294,35 @@ class Sniper:
                 sell_id = self.client.submit_sell(
                     token, 0.99, s.fire_shares,
                     f"{a.name}-{s.fire_side}-CLAIM")
-                if not sell_id:
-                    print(f"  [{a.name}] [!] Sell failed — tokens may not have filled")
+                if sell_id:
+                    print(f"  [{a.name}]    💰 Sold tokens → USDC recycled")
+                else:
+                    print(f"  [{a.name}]    ⚠ Sell failed — check positions manually")
         else:
             loss = round(s.fire_shares * s.fire_price, 2)
             self.stats.losses += 1
             self.stats.pnl -= loss
             profit = -loss
             result = "LOSS"
-            print(f"  [{a.name}] ❌ LOSS: {s.fire_side} → -${loss:.2f}"
-                  f" | {a.name}: ${close_price:,.4f} ({gap:+,.4f})")
+            print(f"  [{a.name}] ❌ LOSS: {s.fire_side}"
+                  f" | bought {s.fire_shares:.0f}sh @ ${s.fire_price:.2f}"
+                  f" → resolved {actual} = -${loss:.2f}")
+            print(f"  [{a.name}]    UP=${up_mid:.2f} DOWN=${down_mid:.2f}")
 
+        # Show real balance and running stats
         if not self.dry_run:
-            send_telegram(f"{'✅' if won else '❌'} {a.name} {result}:"
-                          f" {s.fire_side} → ${profit:+.2f}")
+            bal = self.client.get_balance()
+            bal_str = f"${bal:.2f}" if bal else "?"
+            print(f"  [{a.name}]    📊 W/L={self.stats.wins}/{self.stats.losses}"
+                  f" PnL=${self.stats.pnl:+.2f} Cash={bal_str}")
+            send_telegram(
+                f"{'✅' if won else '❌'} {a.name} {result}:"
+                f" {s.fire_side} ${profit:+.2f}"
+                f"\nW/L={self.stats.wins}/{self.stats.losses}"
+                f" PnL=${self.stats.pnl:+.2f}")
+        else:
+            print(f"  [{a.name}]    📊 W/L={self.stats.wins}/{self.stats.losses}"
+                  f" PnL=${self.stats.pnl:+.2f}")
         self._log(result, profit, close_price, gap)
 
     def _log(self, result, pnl, close_price, gap):
