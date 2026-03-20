@@ -58,8 +58,8 @@ SIGMA_MAP = {
 }
 
 # Minimum edge to trade (true_prob - token_price)
-MIN_EDGE = 0.05             # 5% minimum edge
-MIN_EDGE_STRONG = 0.10      # 10% = strong signal, increase bet
+MIN_EDGE = 0.03             # 3% minimum edge (market is efficient, 5% was too strict)
+MIN_EDGE_STRONG = 0.07      # 7% = strong signal, increase bet
 
 # Momentum adjustment: supporting signals can shift true_prob by ±3%
 MAX_MOMENTUM_ADJUST = 0.03

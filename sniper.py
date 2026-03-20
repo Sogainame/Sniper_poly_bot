@@ -435,8 +435,15 @@ class Sniper:
                               f" Δ={sig.delta_pct:+.3f}%"
                               f" T-{sl:.0f}s", end="\r")
 
-                        # Fire condition: prob > 55% AND edge will be checked in _fire
-                        if sig.true_prob >= 0.55 and abs(sig.delta_pct) >= a.min_delta_pct:
+                        # Fire conditions:
+                        # 1. Need ≥3 ticks to have momentum data
+                        # 2. prob > 55%
+                        # 3. Edge checked inside _fire()
+                        has_enough_ticks = len(self.engine.tick_prices) >= 3
+
+                        if (has_enough_ticks
+                                and sig.true_prob >= 0.55
+                                and abs(sig.delta_pct) >= a.min_delta_pct):
                             print(f"\n  [{a.name}] [EVAL] P={sig.true_prob:.0%}"
                                   f" z={sig.z_score:+.2f}")
                             self._fire(sig)
