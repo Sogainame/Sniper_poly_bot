@@ -225,14 +225,11 @@ class PolymarketClient:
                 down_token = clob_ids[1]
 
                 if len(outcomes) >= 2:
-                    # Match token to outcome by index
                     for i, name in enumerate(outcomes):
                         if name.lower() in ("up", "yes") and i < len(clob_ids):
                             up_token = clob_ids[i]
                         elif name.lower() in ("down", "no") and i < len(clob_ids):
                             down_token = clob_ids[i]
-                    print(f"  [TOKENS] UP={outcomes[0]}→{up_token[:12]}..."
-                          f" DOWN={outcomes[1] if len(outcomes)>1 else '?'}→{down_token[:12]}...")
 
                 return {
                     "slug": slug,

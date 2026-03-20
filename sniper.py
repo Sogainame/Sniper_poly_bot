@@ -217,7 +217,11 @@ class Sniper:
         if price > 0:
             self.state.open_price = price
             self.state.open_captured = True
-            print(f"\n  [{a.name}] [OPEN] Window {ts} | {a.name}: ${price:,.4f}")
+            # Человеческое время вместо unix timestamp
+            from datetime import datetime, timezone
+            t_start = datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M")
+            t_end = datetime.fromtimestamp(ts + WINDOW_SECS, timezone.utc).strftime("%H:%M UTC")
+            print(f"\n  [{a.name}] ── {t_start}-{t_end} ── BTC: ${price:,.2f}")
 
         market = self.client.find_market(a.slug_prefix, ts)
         if market:
@@ -225,7 +229,6 @@ class Sniper:
             self.state.up_token = market["up_token"]
             self.state.down_token = market["down_token"]
             self.state.condition_id = market.get("condition_id", "")
-            print(f"  [{a.name}] [MARKET] {_slug_short(market['slug'])}")
         else:
             print(f"  [{a.name}] [!] Market not found for ts={ts}")
 
