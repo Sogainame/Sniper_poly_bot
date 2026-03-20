@@ -428,30 +428,46 @@ class Sniper:
                         if sig.true_prob > s.best_signal.true_prob:
                             s.best_signal = sig
 
+                        # Fetch LIVE token price to compute real edge
+                        edge_str = ""
+                        live_edge = 0.0
+                        if sig.direction and len(self.engine.tick_prices) >= 3:
+                            token_id = s.up_token if sig.direction == "UP" else s.down_token
+                            token_price = self.client.fetch_midpoint(token_id)
+                            if token_price > 0.01:
+                                live_edge = sig.true_prob - token_price
+                                edge_str = f" E={live_edge:+.0%}"
+
+                                # Track best edge seen
+                                if live_edge > s.best_edge:
+                                    s.best_edge = live_edge
+
                         d = "▲" if sig.direction == "UP" else "▼" if sig.direction == "DOWN" else "━"
                         print(f"  [{a.name}] {d} ${p:,.2f}"
                               f" P={sig.true_prob:.0%}"
                               f" z={sig.z_score:+.2f}"
                               f" Δ={sig.delta_pct:+.3f}%"
+                              f"{edge_str}"
                               f" T-{sl:.0f}s", end="\r")
 
-                        # Fire conditions:
-                        # 1. Need ≥3 ticks to have momentum data
-                        # 2. prob > 55%
-                        # 3. Edge checked inside _fire()
-                        has_enough_ticks = len(self.engine.tick_prices) >= 3
+                        # ── Fire logic: wait for time-decay edge ──────────
+                        has_ticks = len(self.engine.tick_prices) >= 3
 
-                        if (has_enough_ticks
+                        # Primary: fire when we have real edge from live token price
+                        if (has_ticks and live_edge >= MIN_EDGE
                                 and sig.true_prob >= 0.55
                                 and abs(sig.delta_pct) >= a.min_delta_pct):
-                            print(f"\n  [{a.name}] [EVAL] P={sig.true_prob:.0%}"
-                                  f" z={sig.z_score:+.2f}")
+                            print(f"\n  [{a.name}] [FIRE] P={sig.true_prob:.0%}"
+                                  f" Edge={live_edge:.1%} z={sig.z_score:+.2f}"
+                                  f" T-{sl:.0f}s")
                             self._fire(sig)
 
-                        # Deadline: use best signal at T-end+2
+                        # Deadline: at T-end, fire if best signal was strong
                         elif (sl <= a.eval_end_secs + 2
-                              and s.best_signal.true_prob >= 0.58):
-                            print(f"\n  [{a.name}] [DEADLINE] P={s.best_signal.true_prob:.0%}")
+                              and s.best_signal.true_prob >= 0.60
+                              and s.best_edge >= 0.02):
+                            print(f"\n  [{a.name}] [DEADLINE] P={s.best_signal.true_prob:.0%}"
+                                  f" BestEdge={s.best_edge:.1%}")
                             self._fire(s.best_signal)
 
             elif not in_eval and not s.fired and sl > a.eval_start_secs:

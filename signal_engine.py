@@ -38,16 +38,19 @@ except ImportError:
         return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-# ── Historical 5-min BTC volatility ──────────────────────────────────────────
-# Observed from Binance 1-min candles: BTC moves ~0.05-0.15% per 5 minutes.
-# σ (sigma) = annualized vol / √(periods_per_year)
-# BTC annualized vol ≈ 50-70%. Per 5 min: 0.65 / √(105120) ≈ 0.002 = 0.2%
-# But for our model we use the 5-min standard deviation directly.
-BTC_5MIN_SIGMA = 0.0020     # ~0.20% per 5 min (conservative)
-ETH_5MIN_SIGMA = 0.0025     # ETH more volatile
-SOL_5MIN_SIGMA = 0.0035     # SOL even more
-XRP_5MIN_SIGMA = 0.0030
-DOGE_5MIN_SIGMA = 0.0050    # Meme coin, very volatile
+# ── Calibrated 5-min volatility (σ) ──────────────────────────────────────────
+# Reverse-engineered from observed Polymarket token prices (Archetapp data):
+#   Δ=0.02% → token $0.55 → implied σ=0.00225
+#   Δ=0.05% → token $0.65 → implied σ=0.00184
+#   Δ=0.10% → token $0.80 → implied σ=0.00168
+#   Δ=0.15% → token $0.93 → implied σ=0.00144
+# Average: σ=0.00180 (0.18%)
+# This matches BTC annualized vol ~55% → per 5min: 0.55/√105192 ≈ 0.0017
+BTC_5MIN_SIGMA = 0.0018
+ETH_5MIN_SIGMA = 0.0023     # ETH ~1.3x BTC vol
+SOL_5MIN_SIGMA = 0.0032     # SOL ~1.8x BTC vol
+XRP_5MIN_SIGMA = 0.0029     # XRP ~1.6x
+DOGE_5MIN_SIGMA = 0.0045    # DOGE ~2.5x
 
 SIGMA_MAP = {
     "btc": BTC_5MIN_SIGMA,
