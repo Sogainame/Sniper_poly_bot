@@ -50,6 +50,7 @@ class WindowState:
     fire_shares: float = 0.0
     fire_confidence: float = 0.0
     order_id: str | None = None
+    early_sold: bool = False
 
 
 @dataclass
@@ -221,7 +222,7 @@ class Sniper:
 
     def _on_window_end(self):
         self.stats.windows += 1
-        if not self.state.fired:
+        if not self.state.fired or self.state.early_sold:
             return
         time.sleep(3)
         self._check_result()
@@ -359,6 +360,36 @@ class Sniper:
                     s.open_captured = True
 
             in_eval = a.eval_end_secs <= sl <= a.eval_start_secs
+
+            # ── Early exit: sell position if token price rose +$0.10 ──
+            if s.fired and s.fire_side and not s.early_sold and sl > 5:
+                if now - last_tick >= 2.0:
+                    last_tick = now
+                    token = s.up_token if s.fire_side == "UP" else s.down_token
+                    cur_token = self.client.fetch_midpoint(token)
+                    if cur_token > 0.01:
+                        gain = cur_token - s.fire_price
+                        print(f"  [{a.name}] 📊 {s.fire_side} token"
+                              f" ${cur_token:.2f} (gain={gain:+.2f})"
+                              f" T-{sl:.0f}s", end="\r")
+                        if gain >= 0.10:
+                            # Sell at current price - 0.01 (maker)
+                            sell_price = round(cur_token - 0.01, 2)
+                            profit = round(s.fire_shares * gain * 0.98, 2)
+                            print(f"\n  [{a.name}] 💰 EARLY EXIT: sell"
+                                  f" @ {sell_price:.2f} (bought {s.fire_price:.2f})"
+                                  f" +${profit:.2f}")
+                            if not self.dry_run:
+                                self.client.submit_sell(
+                                    token, sell_price, s.fire_shares,
+                                    f"{a.name}-{s.fire_side}-EARLY")
+                            s.early_sold = True
+                            self.stats.wins += 1
+                            self.stats.pnl += profit
+                            if not self.dry_run:
+                                send_telegram(
+                                    f"💰 {a.name} EARLY EXIT:"
+                                    f" {s.fire_side} +${profit:.2f}")
 
             if in_eval and not s.fired and s.open_captured and s.up_token:
                 if now - last_tick >= 2.0:
