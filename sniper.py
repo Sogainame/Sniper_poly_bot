@@ -122,7 +122,6 @@ class Sniper:
         s = self.state
         if s.fired:
             return
-        s.fired = True
         a = self.asset
 
         token = s.up_token if sig.direction == "UP" else s.down_token
@@ -130,8 +129,7 @@ class Sniper:
 
         # Retry once after 0.5s if price not available
         if buy_price <= 0:
-            import time as _t
-            _t.sleep(0.5)
+            time.sleep(0.5)
             buy_price = self.client.get_buy_price(token, a.max_token_price, a.min_token_price)
 
         # DRY RUN fallback: estimate price from delta (observed pricing model)
@@ -153,14 +151,17 @@ class Sniper:
         if buy_price <= 0:
             print(f"  [{a.name}] [SKIP] No valid price for {sig.direction}")
             self.stats.skipped += 1
-            return
+            return  # NOT setting s.fired — can retry this window
 
         bet = self._kelly_bet(sig.confidence, buy_price)
         if bet < MIN_BET_USD:
             print(f"  [{a.name}] [SKIP] Kelly: no edge"
                   f" (conf={sig.confidence:.0%} price={buy_price:.2f})")
             self.stats.skipped += 1
-            return
+            return  # NOT setting s.fired — can retry this window
+
+        # All checks passed — NOW lock the window
+        s.fired = True
 
         shares = max(bet / buy_price, 5)
         cost = shares * buy_price
@@ -211,8 +212,8 @@ class Sniper:
         market = self.client.find_market(a.slug_prefix, ts)
         if market:
             self.state.slug = market["slug"]
-            self.state.up_token = market["token_ids"][0]
-            self.state.down_token = market["token_ids"][1]
+            self.state.up_token = market["up_token"]
+            self.state.down_token = market["down_token"]
             self.state.condition_id = market.get("condition_id", "")
             print(f"  [{a.name}] [MARKET] {_slug_short(market['slug'])}")
         else:
@@ -231,15 +232,29 @@ class Sniper:
         if not s.fire_side:
             return
 
-        close_price = self.client.fetch_price(a.binance_symbol)
-        gap = close_price - s.open_price if close_price > 0 else 0
+        # Determine result from POLYMARKET token prices (actual resolution source)
+        # After resolution: winning token → midpoint ~$0.95-1.00, losing → ~$0.00-0.05
+        up_mid = self.client.fetch_midpoint(s.up_token)
+        down_mid = self.client.fetch_midpoint(s.down_token)
 
-        if close_price > 0:
+        if up_mid > 0.01 or down_mid > 0.01:
+            # Use token prices to determine actual outcome
+            if up_mid > down_mid:
+                actual = "UP"
+            elif down_mid > up_mid:
+                actual = "DOWN"
+            else:
+                actual = ""
+            won = (s.fire_side == actual) if actual else False
+        else:
+            # Fallback: Binance price (less reliable)
+            close_price = self.client.fetch_price(a.binance_symbol)
+            gap = close_price - s.open_price if close_price > 0 else 0
             actual = "UP" if gap >= 0 else "DOWN"
             won = (s.fire_side == actual)
-        else:
-            token = s.up_token if s.fire_side == "UP" else s.down_token
-            won = self.client.fetch_midpoint(token) >= 0.70
+
+        close_price = self.client.fetch_price(a.binance_symbol)
+        gap = close_price - s.open_price if close_price > 0 else 0
 
         if won:
             profit = round(s.fire_shares * (1.0 - s.fire_price) * 0.98, 2)

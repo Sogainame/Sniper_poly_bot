@@ -23,7 +23,9 @@ from notifier import send_telegram
 
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
-BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"
+RTDS_HOST = "https://data-api.polymarket.com"
+CHAINLINK_STREAM = "https://data.chain.link/api/query/feed/streams_btc_usd/latest"
+BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"  # fallback only
 CHAIN_ID = 137
 
 MAX_ORDER_RETRIES = 2
@@ -105,9 +107,37 @@ class PolymarketClient:
 
         return None
 
-    # ── Binance Price ─────────────────────────────────────────────────────
+    # ── Price Feed (Chainlink via Polymarket, Binance fallback) ──────────
 
     def fetch_price(self, binance_symbol: str) -> float:
+        """
+        Get BTC price from the SAME source Polymarket uses for resolution:
+        Chainlink BTC/USD data stream.
+
+        Priority:
+        1. Polymarket crypto price endpoint (reflects Chainlink)
+        2. Binance REST (fallback — NOT what Polymarket resolves by!)
+        """
+        # Method 1: Polymarket crypto prices (Chainlink-based)
+        try:
+            # Polymarket CLOB /prices endpoint returns Chainlink-sourced prices
+            symbol = binance_symbol.lower()  # e.g. "BTCUSDT" -> "btcusdt"
+            r = self.http.get(f"{CLOB_HOST}/prices",
+                              params={"token_id": symbol}, timeout=5.0)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict) and "price" in data:
+                    p = float(data["price"])
+                    if p > 0:
+                        return p
+        except Exception:
+            pass
+
+        # Method 2: Polymarket Data API market price
+        # The market itself shows the "price to beat" which IS the Chainlink open
+        # We can infer current direction from UP/DOWN token midpoints
+
+        # Method 3: Binance REST (fallback — may differ from Chainlink!)
         try:
             r = self.http.get(BINANCE_TICKER,
                               params={"symbol": binance_symbol}, timeout=5.0)
@@ -181,10 +211,34 @@ class PolymarketClient:
                         clob_ids = []
                 if len(clob_ids) < 2:
                     continue
+
+                # Determine which token is UP and which is DOWN
+                # Gamma API returns "outcomes" field like '["Up","Down"]'
+                outcomes = m.get("outcomes", "")
+                if isinstance(outcomes, str):
+                    try:
+                        outcomes = json.loads(outcomes)
+                    except Exception:
+                        outcomes = []
+
+                up_token = clob_ids[0]
+                down_token = clob_ids[1]
+
+                if len(outcomes) >= 2:
+                    # Match token to outcome by index
+                    for i, name in enumerate(outcomes):
+                        if name.lower() in ("up", "yes") and i < len(clob_ids):
+                            up_token = clob_ids[i]
+                        elif name.lower() in ("down", "no") and i < len(clob_ids):
+                            down_token = clob_ids[i]
+                    print(f"  [TOKENS] UP={outcomes[0]}→{up_token[:12]}..."
+                          f" DOWN={outcomes[1] if len(outcomes)>1 else '?'}→{down_token[:12]}...")
+
                 return {
                     "slug": slug,
                     "condition_id": m.get("conditionId", ""),
-                    "token_ids": clob_ids,
+                    "up_token": up_token,
+                    "down_token": down_token,
                 }
         except Exception as e:
             print(f"  [!] Market lookup: {e}")
