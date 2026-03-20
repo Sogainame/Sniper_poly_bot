@@ -56,6 +56,8 @@ class Stats:
     wins: int = 0
     losses: int = 0
     flats: int = 0
+    early_exits: int = 0
+    closed: int = 0
     pnl: float = 0.0
 
 
@@ -235,6 +237,14 @@ class Sniper:
         self.state.early_sell_order_id = order_id
         pnl = (bid - self.state.fire_price) * self.state.fire_shares
         self.stats.pnl += pnl
+        self.stats.closed += 1
+        self.stats.early_exits += 1
+        if pnl > 0:
+            self.stats.wins += 1
+        elif pnl < 0:
+            self.stats.losses += 1
+        else:
+            self.stats.flats += 1
         text = f"💸 {self.asset.name} early-exit @ {bid:.3f} | pnl=${pnl:+.2f}"
         print(text)
         send_telegram(text)
@@ -324,6 +334,7 @@ class Sniper:
             self.stats.losses += 1
             result = "LOSS"
 
+        self.stats.closed += 1
         self.stats.pnl += pnl
         self._log_trade(
             resolved_side=resolved_side,
@@ -348,7 +359,8 @@ class Sniper:
             self._reset_window(current_window, price)
 
         if current_window != self.state.window_ts:
-            self._finalize_previous_window(price)
+            prev_close_price = self.engine.tick_prices[-1] if self.engine.tick_prices else self.state.open_price or price
+            self._finalize_previous_window(prev_close_price)
             self._reset_window(current_window, price)
 
         self.engine.add_tick(price, now_ts)
@@ -373,6 +385,7 @@ class Sniper:
     def summary(self) -> str:
         return (
             f"{self.asset.name}: windows={self.stats.windows} fired={self.stats.fired} "
+            f"closed={self.stats.closed} early_exits={self.stats.early_exits} skipped={self.stats.skipped} "
             f"wins={self.stats.wins} losses={self.stats.losses} flats={self.stats.flats} "
             f"pnl=${self.stats.pnl:+.2f}"
         )

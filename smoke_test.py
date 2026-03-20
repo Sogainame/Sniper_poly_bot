@@ -73,3 +73,11 @@ if __name__ == "__main__":
     sniper.step(window + 301)
 
     print(sniper.summary())
+
+
+    assert sniper.stats.fired == 1
+    assert sniper.stats.closed == 1
+    assert sniper.stats.early_exits == 1
+    assert sniper.stats.wins == 1
+    assert sniper.stats.losses == 0
+    assert sniper.stats.flats == 0
