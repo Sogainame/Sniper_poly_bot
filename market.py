@@ -44,28 +44,56 @@ class PolymarketClient:
     # ── Balance ───────────────────────────────────────────────────────────
 
     def get_balance(self) -> float | None:
+        # Method 1: CLOB API
         try:
             resp = self.clob.get_balance_allowance()
             if isinstance(resp, dict):
                 raw = float(resp.get("balance", 0) or 0)
-                return raw / 1e6 if raw > 10_000 else raw
+                bal = raw / 1e6 if raw > 10_000 else raw
+                if bal > 0.01:
+                    return bal
         except Exception:
             pass
+
+        # Method 2: Polymarket data API
         funder = config.POLY_FUNDER_ADDRESS
-        if not funder:
-            return None
-        try:
-            r = self.http.get("https://data-api.polymarket.com/value",
-                              params={"user": funder.lower()})
-            if r.status_code == 200:
-                data = r.json()
-                entries = data if isinstance(data, list) else [data]
-                for entry in entries:
-                    for key in ("portfolioValue", "value", "cashBalance", "balance"):
-                        if key in entry:
-                            return float(entry[key])
-        except Exception:
-            pass
+        if funder:
+            try:
+                r = self.http.get("https://data-api.polymarket.com/value",
+                                  params={"user": funder.lower()})
+                if r.status_code == 200:
+                    data = r.json()
+                    entries = data if isinstance(data, list) else [data]
+                    for entry in entries:
+                        for key in ("portfolioValue", "value", "cashBalance", "balance"):
+                            if key in entry:
+                                v = float(entry[key])
+                                if v > 0.01:
+                                    return v
+            except Exception:
+                pass
+
+        # Method 3: Direct USDC balance on Polygon via public RPC
+        if funder:
+            try:
+                usdc_contract = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+                # balanceOf(address) selector = 0x70a08231
+                data_hex = "0x70a08231" + funder.lower().replace("0x", "").zfill(64)
+                r = self.http.post(
+                    "https://polygon-rpc.com",
+                    json={"jsonrpc": "2.0", "method": "eth_call", "id": 1,
+                          "params": [{"to": usdc_contract, "data": data_hex}, "latest"]},
+                    timeout=10.0,
+                )
+                if r.status_code == 200:
+                    result = r.json().get("result", "0x0")
+                    raw = int(result, 16)
+                    bal = raw / 1e6
+                    if bal > 0.01:
+                        return bal
+            except Exception:
+                pass
+
         return None
 
     # ── Binance Price ─────────────────────────────────────────────────────
