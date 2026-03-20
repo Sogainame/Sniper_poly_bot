@@ -29,6 +29,7 @@ class PolymarketClient:
     def __init__(self):
         self.http = httpx.Client(timeout=10.0)
         self.clob = self._init_clob()
+        self._api_creds = self._derive_creds()
 
     def _init_clob(self) -> ClobClient:
         client = ClobClient(
@@ -38,8 +39,50 @@ class PolymarketClient:
             signature_type=1,
             funder=config.POLY_FUNDER_ADDRESS,
         )
-        client.set_api_creds(client.create_or_derive_api_creds())
+        try:
+            creds = client.create_or_derive_api_creds()
+            if creds:
+                client.set_api_creds(creds)
+        except Exception:
+            pass
         return client
+
+    def _derive_creds(self) -> dict | None:
+        """Derive API creds and store for direct REST calls."""
+        try:
+            creds = self.clob.create_or_derive_api_creds()
+            if creds and isinstance(creds, dict):
+                return creds
+            # Try accessing stored creds
+            stored = getattr(self.clob, 'api_creds', None) or getattr(self.clob, 'creds', None)
+            if stored:
+                return stored
+        except Exception:
+            pass
+        # Manual derive via REST
+        try:
+            from py_clob_client.signer import Signer
+            from eth_account import Account
+            signer = Signer(config.POLY_PRIVATE_KEY, CHAIN_ID)
+            r = self.http.get(f"{CLOB_HOST}/auth/derive-api-key",
+                              headers=signer.derive_api_key_headers(),
+                              timeout=10.0)
+            if r.status_code == 200:
+                data = r.json()
+                return data
+        except Exception:
+            pass
+        return None
+
+    def _get_auth_headers(self) -> dict:
+        """Get auth headers for CLOB REST calls."""
+        if not self._api_creds:
+            return {}
+        return {
+            "POLY_API_KEY": self._api_creds.get("apiKey", ""),
+            "POLY_API_SECRET": self._api_creds.get("secret", ""),
+            "POLY_PASSPHRASE": self._api_creds.get("passphrase", ""),
+        }
 
     # ── Balance ───────────────────────────────────────────────────────────
 
@@ -55,15 +98,10 @@ class PolymarketClient:
         except Exception:
             pass
 
-        # Method 2: Direct CLOB REST API (bypasses broken client method)
-        try:
-            creds = self.clob.get_api_creds()
-            if creds:
-                headers = {
-                    "POLY_API_KEY": creds.get("apiKey", ""),
-                    "POLY_API_SECRET": creds.get("secret", ""),
-                    "POLY_PASSPHRASE": creds.get("passphrase", ""),
-                }
+        # Method 2: Direct CLOB REST with derived creds
+        headers = self._get_auth_headers()
+        if headers:
+            try:
                 r = self.http.get(f"{CLOB_HOST}/balance-allowance",
                                   headers=headers, timeout=10.0)
                 if r.status_code == 200:
@@ -73,11 +111,27 @@ class PolymarketClient:
                         bal = raw / 1e6 if raw > 10_000 else raw
                         if bal > 0.01:
                             return bal
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-        # Method 3: Polymarket data API
+        # Method 3: Polymarket profile API (shows cash balance on site)
         funder = config.POLY_FUNDER_ADDRESS
+        if funder:
+            try:
+                r = self.http.get(
+                    f"https://gamma-api.polymarket.com/profiles/{funder.lower()}",
+                    timeout=10.0)
+                if r.status_code == 200:
+                    data = r.json()
+                    for key in ("cashBalance", "balance", "portfolioValue"):
+                        if key in data:
+                            v = float(data[key])
+                            if v > 0.01:
+                                return v
+            except Exception:
+                pass
+
+        # Method 4: Polymarket data API
         if funder:
             try:
                 r = self.http.get("https://data-api.polymarket.com/value",
@@ -94,24 +148,20 @@ class PolymarketClient:
             except Exception:
                 pass
 
-        # Method 4: Direct on-chain USDC check
+        # Method 5: Direct on-chain USDC
         if funder:
-            usdc_contracts = [
+            for contract, decimals in [
                 ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", 6),
                 ("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6),
-            ]
-            for contract, decimals in usdc_contracts:
+            ]:
                 try:
                     data_hex = "0x70a08231" + funder.lower().replace("0x", "").zfill(64)
-                    r = self.http.post(
-                        "https://polygon-rpc.com",
+                    r = self.http.post("https://polygon-rpc.com",
                         json={"jsonrpc": "2.0", "method": "eth_call", "id": 1,
                               "params": [{"to": contract, "data": data_hex}, "latest"]},
-                        timeout=10.0,
-                    )
+                        timeout=10.0)
                     if r.status_code == 200:
-                        result = r.json().get("result", "0x0")
-                        raw = int(result, 16)
+                        raw = int(r.json().get("result", "0x0"), 16)
                         bal = raw / (10 ** decimals)
                         if bal > 0.01:
                             return bal
