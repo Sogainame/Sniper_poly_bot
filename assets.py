@@ -36,14 +36,11 @@ BTC = AssetConfig(
     chainlink_symbol="btc/usd",
     min_delta_pct=0.02,
     min_confidence=0.30,
-    max_token_price=0.82,
-    min_token_price=0.52,
-    eval_start_secs=60,         # was 180 — T-170s entry caused 4/4 losses (reversals)
-    eval_end_secs=20,           # was 30 — give 20s for order to fill before close
+    max_token_price=0.88,       # was 0.82 — ask часто 0.83-0.90, ордер не заполнялся
+    min_token_price=0.52,       # ROI при 0.88: 12% net. Breakeven WR=88%. Наш WR~90%.
+    eval_start_secs=60,
+    eval_end_secs=20,
     priority=1,
-    # Math: at T-60s, Δ=0.03% gives P(hold)=69% vs 58% at T-170s
-    # 4 minutes of price action filters noise from signal
-    # MM hasn't fully repriced yet → edge preserved
 )
 
 SOL = AssetConfig(
