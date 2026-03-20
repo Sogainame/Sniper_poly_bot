@@ -1,10 +1,17 @@
 """
 Polymarket API layer — market discovery, prices, order submission.
-Asset-agnostic: takes slug_prefix from AssetConfig.
+
+Balance fix based on py-clob-client issue #83:
+  get_balance_allowance() crashes when params=None.
+  Workaround: pass BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+  
+Creds: create_or_derive_api_creds() returns ApiCreds object (not dict),
+  store attrs manually for REST fallback.
 """
 
 import json
 import os
+import time
 
 import httpx
 from py_clob_client.client import ClobClient
@@ -19,17 +26,19 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"
 CHAIN_ID = 137
 
-MAKER_SPREAD = 0.02
 MAX_ORDER_RETRIES = 2
 RETRY_DELAY = 0.5
+MAKER_SPREAD = 0.02
 
 
 class PolymarketClient:
 
     def __init__(self):
         self.http = httpx.Client(timeout=10.0)
+        self._api_key = ""
+        self._api_secret = ""
+        self._api_passphrase = ""
         self.clob = self._init_clob()
-        self._api_creds = self._derive_creds()
 
     def _init_clob(self) -> ClobClient:
         client = ClobClient(
@@ -43,53 +52,25 @@ class PolymarketClient:
             creds = client.create_or_derive_api_creds()
             if creds:
                 client.set_api_creds(creds)
-        except Exception:
-            pass
+                # Store creds for direct REST (ApiCreds is not a dict)
+                self._api_key = getattr(creds, 'api_key', '')
+                self._api_secret = getattr(creds, 'api_secret', '')
+                self._api_passphrase = getattr(creds, 'api_passphrase', '')
+        except Exception as e:
+            print(f"  [!] CLOB creds warning: {e}")
         return client
 
-    def _derive_creds(self) -> dict | None:
-        """Derive API creds and store for direct REST calls."""
-        try:
-            creds = self.clob.create_or_derive_api_creds()
-            if creds and isinstance(creds, dict):
-                return creds
-            # Try accessing stored creds
-            stored = getattr(self.clob, 'api_creds', None) or getattr(self.clob, 'creds', None)
-            if stored:
-                return stored
-        except Exception:
-            pass
-        # Manual derive via REST
-        try:
-            from py_clob_client.signer import Signer
-            from eth_account import Account
-            signer = Signer(config.POLY_PRIVATE_KEY, CHAIN_ID)
-            r = self.http.get(f"{CLOB_HOST}/auth/derive-api-key",
-                              headers=signer.derive_api_key_headers(),
-                              timeout=10.0)
-            if r.status_code == 200:
-                data = r.json()
-                return data
-        except Exception:
-            pass
-        return None
-
-    def _get_auth_headers(self) -> dict:
-        """Get auth headers for CLOB REST calls."""
-        if not self._api_creds:
-            return {}
-        return {
-            "POLY_API_KEY": self._api_creds.get("apiKey", ""),
-            "POLY_API_SECRET": self._api_creds.get("secret", ""),
-            "POLY_PASSPHRASE": self._api_creds.get("passphrase", ""),
-        }
-
     # ── Balance ───────────────────────────────────────────────────────────
+    # py-clob-client bug #83: get_balance_allowance() without params crashes.
+    # Fix: pass BalanceAllowanceParams explicitly.
+    # Fallback: direct REST with stored API creds.
 
     def get_balance(self) -> float | None:
-        # Method 1: CLOB client library
+        # Method 1: CLOB client with explicit params (fix for bug #83)
         try:
-            resp = self.clob.get_balance_allowance()
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            resp = self.clob.get_balance_allowance(params)
             if isinstance(resp, dict):
                 raw = float(resp.get("balance", 0) or 0)
                 bal = raw / 1e6 if raw > 10_000 else raw
@@ -98,12 +79,20 @@ class PolymarketClient:
         except Exception:
             pass
 
-        # Method 2: Direct CLOB REST with derived creds
-        headers = self._get_auth_headers()
-        if headers:
+        # Method 2: Direct CLOB REST API
+        if self._api_key:
             try:
-                r = self.http.get(f"{CLOB_HOST}/balance-allowance",
-                                  headers=headers, timeout=10.0)
+                headers = {
+                    "POLY_API_KEY": self._api_key,
+                    "POLY_API_SECRET": self._api_secret,
+                    "POLY_PASSPHRASE": self._api_passphrase,
+                }
+                r = self.http.get(
+                    f"{CLOB_HOST}/balance-allowance",
+                    params={"asset_type": "COLLATERAL", "signature_type": "1"},
+                    headers=headers,
+                    timeout=10.0,
+                )
                 if r.status_code == 200:
                     data = r.json()
                     if isinstance(data, dict):
@@ -113,60 +102,6 @@ class PolymarketClient:
                             return bal
             except Exception:
                 pass
-
-        # Method 3: Polymarket profile API (shows cash balance on site)
-        funder = config.POLY_FUNDER_ADDRESS
-        if funder:
-            try:
-                r = self.http.get(
-                    f"https://gamma-api.polymarket.com/profiles/{funder.lower()}",
-                    timeout=10.0)
-                if r.status_code == 200:
-                    data = r.json()
-                    for key in ("cashBalance", "balance", "portfolioValue"):
-                        if key in data:
-                            v = float(data[key])
-                            if v > 0.01:
-                                return v
-            except Exception:
-                pass
-
-        # Method 4: Polymarket data API
-        if funder:
-            try:
-                r = self.http.get("https://data-api.polymarket.com/value",
-                                  params={"user": funder.lower()})
-                if r.status_code == 200:
-                    data = r.json()
-                    entries = data if isinstance(data, list) else [data]
-                    for entry in entries:
-                        for key in ("cashBalance", "balance", "portfolioValue", "value"):
-                            if key in entry:
-                                v = float(entry[key])
-                                if v > 0.01:
-                                    return v
-            except Exception:
-                pass
-
-        # Method 5: Direct on-chain USDC
-        if funder:
-            for contract, decimals in [
-                ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", 6),
-                ("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6),
-            ]:
-                try:
-                    data_hex = "0x70a08231" + funder.lower().replace("0x", "").zfill(64)
-                    r = self.http.post("https://polygon-rpc.com",
-                        json={"jsonrpc": "2.0", "method": "eth_call", "id": 1,
-                              "params": [{"to": contract, "data": data_hex}, "latest"]},
-                        timeout=10.0)
-                    if r.status_code == 200:
-                        raw = int(r.json().get("result", "0x0"), 16)
-                        bal = raw / (10 ** decimals)
-                        if bal > 0.01:
-                            return bal
-                except Exception:
-                    pass
 
         return None
 
@@ -249,7 +184,7 @@ class PolymarketClient:
                 return {
                     "slug": slug,
                     "condition_id": m.get("conditionId", ""),
-                    "token_ids": clob_ids,  # [UP, DOWN]
+                    "token_ids": clob_ids,
                 }
         except Exception as e:
             print(f"  [!] Market lookup: {e}")
@@ -259,7 +194,6 @@ class PolymarketClient:
 
     def submit_maker_buy(self, token_id: str, price: float, size: float,
                          label: str) -> str | None:
-        import time
         for attempt in range(1, MAX_ORDER_RETRIES + 1):
             try:
                 args = OrderArgs(token_id=token_id, price=round(price, 2),
