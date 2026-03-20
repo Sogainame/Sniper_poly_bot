@@ -178,16 +178,29 @@ class PolymarketClient:
         return {"best_bid": 0.0, "best_ask": 0.0}
 
     def get_buy_price(self, token_id: str, max_price: float, min_price: float) -> float:
-        mid = self.fetch_midpoint(token_id)
+        """Цена покупки = best_ask (гарантированный fill, taker fee ~1.5%)."""
         book = self.fetch_book(token_id)
-        if mid > 0.01:
-            price = mid + MAKER_SPREAD
-        elif book["best_ask"] > 0:
-            price = book["best_ask"] - 0.01
+        if book["best_ask"] > 0:
+            price = book["best_ask"]
         else:
-            return 0.0
+            # Fallback на midpoint если стакан пустой
+            mid = self.fetch_midpoint(token_id)
+            if mid > 0.01:
+                price = mid + 0.02
+            else:
+                return 0.0
         price = round(min(price, max_price), 2)
         return price if price >= min_price else 0.0
+
+    def get_sell_price(self, token_id: str) -> float:
+        """Цена продажи = best_bid (гарантированный fill)."""
+        book = self.fetch_book(token_id)
+        if book["best_bid"] > 0:
+            return round(book["best_bid"], 2)
+        mid = self.fetch_midpoint(token_id)
+        if mid > 0.01:
+            return round(mid - 0.01, 2)
+        return 0.0
 
     # ── Market Lookup ─────────────────────────────────────────────────────
 

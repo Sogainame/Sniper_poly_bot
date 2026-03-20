@@ -280,7 +280,7 @@ class Sniper:
             print(f"  [{a.name}]    UP=${up_mid:.2f} DOWN=${down_mid:.2f}"
                   f" → resolved: {actual}")
 
-            # Auto-sell winning tokens at $0.99 to recycle back to USDC
+            # Auto-sell winning tokens at best_bid to recycle back to USDC
             if not self.dry_run:
                 token = s.up_token if s.fire_side == "UP" else s.down_token
                 time.sleep(3)
@@ -294,8 +294,11 @@ class Sniper:
                 except Exception:
                     pass
 
+                sell_price = self.client.get_sell_price(token)
+                if sell_price < 0.90:
+                    sell_price = 0.99  # fallback после resolution
                 sell_id = self.client.submit_sell(
-                    token, 0.99, s.fire_shares,
+                    token, sell_price, s.fire_shares,
                     f"{a.name}-{s.fire_side}-CLAIM")
                 if sell_id:
                     print(f"  [{a.name}]    💰 Sold tokens → USDC recycled")
@@ -402,9 +405,12 @@ class Sniper:
                               f" ${cur_token:.2f} (gain={gain:+.2f})"
                               f" T-{sl:.0f}s", end="\r")
                         if gain >= 0.10:
-                            # Sell at current price - 0.01 (maker)
-                            sell_price = round(cur_token - 0.01, 2)
-                            profit = round(s.fire_shares * gain * 0.98, 2)
+                            # Продаём по best_bid — гарантированный fill
+                            sell_price = self.client.get_sell_price(token)
+                            if sell_price <= s.fire_price:
+                                sell_price = round(cur_token - 0.01, 2)  # fallback
+                            actual_gain = sell_price - s.fire_price
+                            profit = round(s.fire_shares * actual_gain * 0.98, 2)
                             print(f"\n  [{a.name}] 💰 EARLY EXIT: sell"
                                   f" @ {sell_price:.2f} (bought {s.fire_price:.2f})"
                                   f" +${profit:.2f}")
