@@ -1,6 +1,13 @@
 """
 Core Sniper engine — runs one asset at a time.
 Takes AssetConfig for per-asset thresholds.
+
+Step 3 changes:
+- removes fake Kelly sizing (there is no calibrated win probability yet)
+- adds a deterministic risk ladder based on signal quality
+- adds alignment checks so the bot avoids firing on internally contradictory signals
+- requires confirmation across ticks, not just one noisy score spike
+- tightens late-window fallback so weak end-of-window guesses do not fire
 """
 
 import csv
@@ -18,11 +25,30 @@ WINDOW_SECS = 300
 DRY_RUN_BALANCE = 20.0
 MIN_BET_USD = 1.0
 BALANCE_RESERVE = 0.50
+EARLY_EXIT_GAIN = 0.10
+MIN_SCORE_TO_FIRE = 3.5
+STRONG_SCORE_TO_FIRE = 5.5
+MIN_CONFIRM_TICKS = 2
 
 MODES = {
-    "safe":       {"kelly_fraction": 0.25, "max_bet_pct": 0.25, "label": "Safe (¼ Kelly)"},
-    "aggressive": {"kelly_fraction": 0.50, "max_bet_pct": 0.50, "label": "Aggressive (½ Kelly)"},
-    "degen":      {"kelly_fraction": 1.00, "max_bet_pct": 1.00, "label": "Degen (full Kelly)"},
+    "safe": {
+        "min_risk_pct": 0.03,
+        "max_risk_pct": 0.08,
+        "hard_cap_pct": 0.12,
+        "label": "Safe",
+    },
+    "aggressive": {
+        "min_risk_pct": 0.05,
+        "max_risk_pct": 0.14,
+        "hard_cap_pct": 0.20,
+        "label": "Aggressive",
+    },
+    "degen": {
+        "min_risk_pct": 0.08,
+        "max_risk_pct": 0.22,
+        "hard_cap_pct": 0.30,
+        "label": "Degen",
+    },
 }
 
 CSV_DIR = Path("data/sniper")
@@ -51,6 +77,9 @@ class WindowState:
     fire_confidence: float = 0.0
     order_id: str | None = None
     early_sold: bool = False
+    confirm_ticks: int = 0
+    last_direction: str = ""
+    last_quality: float = 0.0
 
 
 @dataclass
@@ -88,34 +117,133 @@ class Sniper:
     def _secs_left(self) -> float:
         return self._window_ts() + WINDOW_SECS - time.time()
 
-    # ── Kelly ─────────────────────────────────────────────────────────────
+    # ── Signal gating / sizing ────────────────────────────────────────────
 
-    def _kelly_bet(self, confidence: float, token_price: float) -> float:
-        if token_price <= 0.01 or token_price >= 0.99:
-            return 0.0
-        win_prob = min(0.50 + confidence * 0.30, 0.90)
-        b = (1.0 / token_price) - 1.0
-        kelly = (b * win_prob - (1.0 - win_prob)) / b
-
+    def _available_balance(self) -> float:
         bal = self.client.get_balance()
         if self.dry_run and (bal is None or bal < MIN_BET_USD):
             bal = DRY_RUN_BALANCE
-        if bal is None or bal < MIN_BET_USD:
+        if bal is None:
             return 0.0
-        available = bal - BALANCE_RESERVE
+        return max(0.0, bal - BALANCE_RESERVE)
 
-        if kelly <= 0:
-            # Kelly says no mathematical edge at this token price.
-            # For high-confidence signals (>60%) with cheap tokens (<0.85),
-            # use minimum bet as override — the signal may still be profitable.
-            if confidence >= 0.60 and token_price <= 0.85:
-                return MIN_BET_USD
+    def _signal_alignment_ok(self, sig: Signal) -> bool:
+        if sig.direction not in ("UP", "DOWN"):
+            return False
+
+        sign = 1.0 if sig.direction == "UP" else -1.0
+        mom = sig.components.get("mom", 0.0) * sign
+        acc = sig.components.get("acc", 0.0) * sign
+        cons = sig.components.get("cons", 0.0) * sign
+
+        # If supporting components actively disagree with the trade direction,
+        # skip the trade unless the total score is very strong.
+        if mom < -0.5:
+            return False
+        if cons < -0.25:
+            return False
+        if acc < -0.75 and abs(sig.score) < STRONG_SCORE_TO_FIRE:
+            return False
+        return True
+
+    def _signal_quality(self, sig: Signal) -> float:
+        a = self.asset
+        if sig.direction not in ("UP", "DOWN"):
             return 0.0
 
-        kelly *= self.mode_cfg["kelly_fraction"]
-        cap = available * self.mode_cfg["max_bet_pct"]
-        bet = min(available * kelly, cap, self.max_bet)
+        score_q = min(max((abs(sig.score) - MIN_SCORE_TO_FIRE) / 4.0, 0.0), 1.0)
+        conf_floor = max(a.min_confidence, 0.20)
+        conf_q = min(max((sig.confidence - conf_floor) / max(1e-6, 1.0 - conf_floor), 0.0), 1.0)
+        delta_floor = max(a.min_delta_pct, 1e-6)
+        delta_q = min(max((abs(sig.delta_pct) - delta_floor) / (3.0 * delta_floor), 0.0), 1.0)
+
+        quality = 0.45 * score_q + 0.35 * conf_q + 0.20 * delta_q
+        if self._signal_alignment_ok(sig):
+            quality += 0.10
+        else:
+            quality -= 0.30
+        return min(max(quality, 0.0), 1.0)
+
+    def _stake_size(self, sig: Signal, token_price: float) -> float:
+        a = self.asset
+        if token_price <= 0.01 or token_price >= 0.99:
+            return 0.0
+
+        available = self._available_balance()
+        if available < MIN_BET_USD:
+            return 0.0
+
+        quality = self._signal_quality(sig)
+        if quality < 0.20:
+            return 0.0
+
+        risk_pct = self.mode_cfg["min_risk_pct"] + quality * (
+            self.mode_cfg["max_risk_pct"] - self.mode_cfg["min_risk_pct"]
+        )
+
+        # Penalize expensive contracts unless the signal is genuinely strong.
+        if token_price >= min(0.82, a.max_token_price) and quality < 0.55:
+            risk_pct *= 0.5
+
+        # Penalize signals that only barely exceed the minimum delta filter.
+        if abs(sig.delta_pct) < a.min_delta_pct * 1.25:
+            risk_pct *= 0.6
+
+        bet = min(
+            self.max_bet,
+            available * self.mode_cfg["hard_cap_pct"],
+            available * risk_pct,
+        )
         return bet if bet >= MIN_BET_USD else 0.0
+
+    def _update_confirmation(self, sig: Signal):
+        s = self.state
+        a = self.asset
+        basic_ok = (
+            sig.direction in ("UP", "DOWN")
+            and abs(sig.delta_pct) >= a.min_delta_pct
+            and sig.confidence >= a.min_confidence
+            and abs(sig.score) >= MIN_SCORE_TO_FIRE
+            and self._signal_alignment_ok(sig)
+        )
+
+        if not basic_ok:
+            s.confirm_ticks = 0
+            s.last_direction = ""
+            s.last_quality = 0.0
+            return
+
+        quality = self._signal_quality(sig)
+        if sig.direction == s.last_direction and quality >= s.last_quality * 0.80:
+            s.confirm_ticks += 1
+        else:
+            s.confirm_ticks = 1
+        s.last_direction = sig.direction
+        s.last_quality = quality
+
+    def _should_fire(self, sig: Signal, secs_left: float) -> bool:
+        a = self.asset
+        if sig.direction not in ("UP", "DOWN"):
+            return False
+        if abs(sig.delta_pct) < a.min_delta_pct:
+            return False
+        if sig.confidence < a.min_confidence:
+            return False
+        if abs(sig.score) < MIN_SCORE_TO_FIRE:
+            return False
+        if not self._signal_alignment_ok(sig):
+            return False
+
+        quality = self._signal_quality(sig)
+        strong = quality >= 0.65 and abs(sig.score) >= STRONG_SCORE_TO_FIRE
+        confirmed = self.state.confirm_ticks >= MIN_CONFIRM_TICKS and quality >= 0.30
+        late_strong = (
+            secs_left <= a.eval_end_secs + 6
+            and self.state.confirm_ticks >= 1
+            and quality >= 0.50
+            and abs(sig.score) >= 4.5
+        )
+        return strong or confirmed or late_strong
 
     # ── Fire ──────────────────────────────────────────────────────────────
 
@@ -136,14 +264,15 @@ class Sniper:
         if buy_price <= 0:
             print(f"  [{a.name}] [SKIP] No executable ask for {sig.direction}")
             self.stats.skipped += 1
-            return  # NOT setting s.fired — can retry this window
+            return
 
-        bet = self._kelly_bet(sig.confidence, buy_price)
+        bet = self._stake_size(sig, buy_price)
         if bet < MIN_BET_USD:
-            print(f"  [{a.name}] [SKIP] Kelly: no edge"
-                  f" (conf={sig.confidence:.0%} price={buy_price:.2f})")
+            print(f"  [{a.name}] [SKIP] No-trade zone"
+                  f" (score={sig.score:+.1f} conf={sig.confidence:.0%}"
+                  f" price={buy_price:.2f} q={self._signal_quality(sig):.2f})")
             self.stats.skipped += 1
-            return  # NOT setting s.fired — can retry this window
+            return
 
         # All checks passed — NOW lock the window
         s.fired = True
@@ -152,6 +281,7 @@ class Sniper:
         cost = shares * buy_price
         roi = ((1.0 - buy_price) / buy_price) * 100
         sl = self._secs_left()
+        quality = self._signal_quality(sig)
 
         s.fire_side = sig.direction
         s.fire_price = buy_price
@@ -162,7 +292,8 @@ class Sniper:
         print(f"\n  [{a.name}] 🎯 FIRE: {sig.direction} @ {buy_price:.2f}"
               f" x {shares:.0f}sh = ${cost:.2f}")
         print(f"  [{a.name}]    Δ={sig.delta_pct:+.3f}%"
-              f" Conf={sig.confidence:.0%} ROI={roi:.1f}% T-{sl:.0f}s")
+              f" Conf={sig.confidence:.0%} Score={sig.score:+.1f}"
+              f" Q={quality:.2f} ROI={roi:.1f}% T-{sl:.0f}s")
 
         if self.dry_run:
             s.order_id = f"DRY-{a.name}-{sig.direction}-{s.window_ts}"
@@ -173,7 +304,6 @@ class Sniper:
                 token, buy_price, shares, f"{a.name}-{sig.direction}")
             if s.order_id:
                 self.stats.fired += 1
-                # Show real balance after order
                 bal = self.client.get_balance()
                 if bal is not None:
                     print(f"  [{a.name}]    💰 Balance: ${bal:.2f}")
@@ -186,6 +316,7 @@ class Sniper:
                 f"🎯 {a.name}: {sig.direction} @ {buy_price:.2f}"
                 f" x {shares:.0f}sh = ${cost:.2f}\n"
                 f"Δ={sig.delta_pct:+.3f}% Conf={sig.confidence:.0%}"
+                f" Score={sig.score:+.1f} Q={quality:.2f}"
                 f" ROI={roi:.1f}% T-{sl:.0f}s\n"
                 f"{_slug_short(s.slug)} | {self.mode_name}")
 
@@ -201,11 +332,9 @@ class Sniper:
         if price > 0:
             self.state.open_price = price
             self.state.open_captured = True
-            # Человеческое время вместо unix timestamp
-            from datetime import datetime, timezone
             t_start = datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M")
             t_end = datetime.fromtimestamp(ts + WINDOW_SECS, timezone.utc).strftime("%H:%M UTC")
-            print(f"\n  [{a.name}] ── {t_start}-{t_end} ── BTC: ${price:,.2f}")
+            print(f"\n  [{a.name}] ── {t_start}-{t_end} ── {a.name}: ${price:,.2f}")
 
         market = self.client.find_market(a.slug_prefix, ts)
         if market:
@@ -229,13 +358,10 @@ class Sniper:
         if not s.fire_side:
             return
 
-        # Determine result from token prices first.
-        # If token prices are unavailable, fall back to the reference spot proxy.
         up_mid = self.client.fetch_midpoint(s.up_token)
         down_mid = self.client.fetch_midpoint(s.down_token)
 
         if up_mid > 0.01 or down_mid > 0.01:
-            # Use token prices to infer outcome
             if up_mid > down_mid:
                 actual = "UP"
             elif down_mid > up_mid:
@@ -244,7 +370,6 @@ class Sniper:
                 actual = ""
             won = (s.fire_side == actual) if actual else False
         else:
-            # Fallback: reference spot proxy (less reliable)
             close_price = self.client.fetch_price(a.binance_symbol)
             gap = close_price - s.open_price if close_price > 0 else 0
             actual = "UP" if gap >= 0 else "DOWN"
@@ -264,7 +389,6 @@ class Sniper:
             print(f"  [{a.name}]    UP=${up_mid:.2f} DOWN=${down_mid:.2f}"
                   f" → resolved: {actual}")
 
-            # Auto-sell winning tokens at best_bid to recycle back to USDC
             if not self.dry_run:
                 token = s.up_token if s.fire_side == "UP" else s.down_token
                 time.sleep(3)
@@ -280,7 +404,7 @@ class Sniper:
 
                 sell_price = self.client.get_sell_price(token)
                 if sell_price < 0.90:
-                    sell_price = 0.99  # fallback после resolution
+                    sell_price = 0.99
                 sell_id = self.client.submit_sell(
                     token, sell_price, s.fire_shares,
                     f"{a.name}-{s.fire_side}-CLAIM")
@@ -299,7 +423,6 @@ class Sniper:
                   f" → resolved {actual} = -${loss:.2f}")
             print(f"  [{a.name}]    UP=${up_mid:.2f} DOWN=${down_mid:.2f}")
 
-        # Show real balance and running stats
         if not self.dry_run:
             bal = self.client.get_balance()
             bal_str = f"${bal:.2f}" if bal else "?"
@@ -326,13 +449,14 @@ class Sniper:
             if header:
                 w.writerow(["ts", "window", "slug", "side", "mode",
                             "open", "close", "gap", "delta_pct",
-                            "conf", "score", "price", "shares",
-                            "cost", "result", "pnl", "cum_pnl"])
+                            "conf", "score", "quality", "confirm_ticks",
+                            "price", "shares", "cost", "result", "pnl", "cum_pnl"])
             w.writerow([now, s.window_ts, _slug_short(s.slug), s.fire_side,
                         self.mode_name, f"{s.open_price:.4f}",
                         f"{close_price:.4f}", f"{gap:+.4f}",
                         f"{s.best_signal.delta_pct:+.4f}",
                         f"{s.fire_confidence:.2f}", f"{s.best_signal.score:+.1f}",
+                        f"{self._signal_quality(s.best_signal):.2f}", s.confirm_ticks,
                         f"{s.fire_price:.2f}", f"{s.fire_shares:.0f}",
                         f"{s.fire_shares * s.fire_price:.2f}",
                         result, f"{pnl:.2f}", f"{self.stats.pnl:.2f}"])
@@ -351,6 +475,8 @@ class Sniper:
               f" | Token [{a.min_token_price:.2f}, {a.max_token_price:.2f}]")
         print(f"  Eval T-{a.eval_start_secs}→T-{a.eval_end_secs}"
               f" | Binance: {a.binance_symbol} | Bal: {bal_s}")
+        print(f"  Fire: score ≥ {MIN_SCORE_TO_FIRE:.1f} | strong ≥ {STRONG_SCORE_TO_FIRE:.1f}"
+              f" | confirm ≥ {MIN_CONFIRM_TICKS} ticks")
         print(f"{'─' * 60}")
 
         self.running = True
@@ -377,7 +503,6 @@ class Sniper:
 
             in_eval = a.eval_end_secs <= sl <= a.eval_start_secs
 
-            # ── Early exit: sell position if token price rose +$0.10 ──
             if s.fired and s.fire_side and not s.early_sold and sl > 5:
                 if now - last_tick >= 2.0:
                     last_tick = now
@@ -388,9 +513,8 @@ class Sniper:
                         print(f"  [{a.name}] 📊 {s.fire_side} bid"
                               f" ${sell_price:.2f} (gain={gain:+.2f})"
                               f" T-{sl:.0f}s", end="\r")
-                        if gain >= 0.10:
-                            actual_gain = sell_price - s.fire_price
-                            profit = round(s.fire_shares * actual_gain * 0.98, 2)
+                        if gain >= EARLY_EXIT_GAIN:
+                            profit = round(s.fire_shares * gain * 0.98, 2)
                             print(f"\n  [{a.name}] 💰 EARLY EXIT: sell"
                                   f" @ {sell_price:.2f} (bought {s.fire_price:.2f})"
                                   f" +${profit:.2f}")
@@ -413,41 +537,40 @@ class Sniper:
                     if p > 0:
                         self.engine.add_tick(p, now)
                         sig = self.engine.analyze(s.open_price, p)
+                        self._update_confirmation(sig)
 
-                        if abs(sig.score) > abs(s.best_signal.score):
-                            s.best_signal = sig
+                        # Keep the strongest signal that also passes the basic gating.
+                        if self._signal_alignment_ok(sig):
+                            if abs(sig.score) > abs(s.best_signal.score):
+                                s.best_signal = sig
 
                         d = "▲" if sig.direction == "UP" else "▼" if sig.direction == "DOWN" else "━"
                         print(f"  [{a.name}] {d} ${p:,.4f}"
                               f" Δ={sig.delta_pct:+.3f}%"
                               f" S={sig.score:+.1f}"
                               f" C={sig.confidence:.0%}"
+                              f" Q={self._signal_quality(sig):.2f}"
+                              f" K={s.confirm_ticks}"
                               f" T-{sl:.0f}s", end="\r")
 
-                        ad = abs(sig.delta_pct)
-                        fire = False
-
-                        if (ad >= a.min_delta_pct
-                                and sig.confidence >= a.min_confidence
-                                and abs(sig.score) >= 3.0):
-                            fire = True
-
-                        if (abs(sig.score) >= 3.0
-                                and abs(sig.score - s.prev_score) >= 1.5
-                                and ad >= a.min_delta_pct):
-                            fire = True
-
-                        if (sl <= a.eval_end_secs + 2
-                                and abs(s.best_signal.score) >= 2.5
-                                and abs(s.best_signal.delta_pct) >= a.min_delta_pct):
-                            sig = s.best_signal
-                            fire = True
-
                         s.prev_score = sig.score
-                        if fire:
+                        if self._should_fire(sig, sl):
                             print(f"\n  [{a.name}] [TRIGGER] S={sig.score:+.1f}"
-                                  f" C={sig.confidence:.0%} Δ={sig.delta_pct:+.3f}%")
+                                  f" C={sig.confidence:.0%} Δ={sig.delta_pct:+.3f}%"
+                                  f" Q={self._signal_quality(sig):.2f} K={s.confirm_ticks}")
                             self._fire(sig)
+                        elif (
+                            sl <= a.eval_end_secs + 6
+                            and s.confirm_ticks >= MIN_CONFIRM_TICKS
+                            and self._signal_quality(s.best_signal) >= 0.55
+                            and abs(s.best_signal.score) >= 4.5
+                        ):
+                            print(f"\n  [{a.name}] [TRIGGER-BEST]"
+                                  f" S={s.best_signal.score:+.1f}"
+                                  f" C={s.best_signal.confidence:.0%}"
+                                  f" Δ={s.best_signal.delta_pct:+.3f}%"
+                                  f" Q={self._signal_quality(s.best_signal):.2f}")
+                            self._fire(s.best_signal)
 
             elif not in_eval and not s.fired and sl > a.eval_start_secs:
                 if now - last_tick >= 2.0:
