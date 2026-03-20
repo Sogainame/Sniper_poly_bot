@@ -1,6 +1,12 @@
 """
-Core Sniper engine — runs one asset at a time.
-Takes AssetConfig for per-asset thresholds.
+Core Sniper engine v2 — Brownian CDF + Edge Detection + Drawdown Stop.
+
+Changes from v1:
+  - Kelly uses true_prob from Brownian model (not arbitrary confidence mapping)
+  - Edge detection: only trade when true_prob - token_price > 5%
+  - Drawdown stop: pause if lost > 20% of starting balance
+  - OBI (order book imbalance) filter
+  - Signal engine receives secs_remaining for time-aware analysis
 """
 
 import csv
@@ -10,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from assets import AssetConfig
-from signal_engine import Signal, SignalEngine
+from signal_engine import Signal, SignalEngine, MIN_EDGE, MIN_EDGE_STRONG
 from market import PolymarketClient
 from notifier import send_telegram
 
@@ -18,6 +24,7 @@ WINDOW_SECS = 300
 DRY_RUN_BALANCE = 20.0
 MIN_BET_USD = 1.0
 BALANCE_RESERVE = 0.50
+DRAWDOWN_LIMIT = 0.20      # Stop if lost 20% of starting balance
 
 MODES = {
     "safe":       {"kelly_fraction": 0.25, "max_bet_pct": 0.25, "label": "Safe (¼ Kelly)"},
@@ -43,12 +50,13 @@ class WindowState:
     open_price: float = 0.0
     open_captured: bool = False
     best_signal: Signal = field(default_factory=Signal)
-    prev_score: float = 0.0
+    best_edge: float = 0.0
     fired: bool = False
     fire_side: str = ""
     fire_price: float = 0.0
     fire_shares: float = 0.0
-    fire_confidence: float = 0.0
+    fire_edge: float = 0.0
+    fire_true_prob: float = 0.0
     order_id: str | None = None
 
 
@@ -60,6 +68,8 @@ class Stats:
     wins: int = 0
     losses: int = 0
     pnl: float = 0.0
+    starting_balance: float = 0.0
+    drawdown_stops: int = 0
 
 
 class Sniper:
@@ -72,10 +82,11 @@ class Sniper:
         self.mode_cfg = MODES[mode]
         self.mode_name = mode
         self.max_bet = max_bet
-        self.engine = SignalEngine()
+        self.engine = SignalEngine(asset_name=asset.slug_prefix)
         self.state = WindowState()
         self.stats = Stats()
         self.running = False
+        self._drawdown_paused = False
         CSV_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── Timing ────────────────────────────────────────────────────────────
@@ -87,34 +98,87 @@ class Sniper:
     def _secs_left(self) -> float:
         return self._window_ts() + WINDOW_SECS - time.time()
 
-    # ── Kelly ─────────────────────────────────────────────────────────────
+    # ── Drawdown check ────────────────────────────────────────────────────
 
-    def _kelly_bet(self, confidence: float, token_price: float) -> float:
+    def _check_drawdown(self) -> bool:
+        """Returns True if we should stop trading (drawdown exceeded)."""
+        if self.stats.starting_balance <= 0:
+            return False
+        if self.stats.pnl < 0:
+            loss_pct = abs(self.stats.pnl) / self.stats.starting_balance
+            if loss_pct >= DRAWDOWN_LIMIT:
+                if not self._drawdown_paused:
+                    self._drawdown_paused = True
+                    self.stats.drawdown_stops += 1
+                    msg = (f"🛑 {self.asset.name}: Drawdown stop!"
+                           f" Lost ${abs(self.stats.pnl):.2f}"
+                           f" ({loss_pct:.0%} of starting balance)")
+                    print(f"\n  [{self.asset.name}] {msg}")
+                    send_telegram(msg)
+                return True
+        self._drawdown_paused = False
+        return False
+
+    # ── Kelly with Brownian true_prob ─────────────────────────────────────
+
+    def _kelly_bet(self, true_prob: float, token_price: float) -> float:
+        """
+        Kelly criterion using Brownian-derived true probability.
+        f* = (b*p - q) / b
+        where b = payout odds, p = true_prob, q = 1 - true_prob
+        """
         if token_price <= 0.01 or token_price >= 0.99:
             return 0.0
-        win_prob = min(0.50 + confidence * 0.30, 0.90)
-        b = (1.0 / token_price) - 1.0
-        kelly = (b * win_prob - (1.0 - win_prob)) / b
+        if true_prob <= 0.50 or true_prob >= 0.99:
+            return 0.0
 
+        b = (1.0 / token_price) - 1.0   # net profit per $1 if win
+        p = true_prob
+        q = 1.0 - p
+        kelly = (b * p - q) / b
+
+        if kelly <= 0:
+            return 0.0
+
+        # Get balance
         bal = self.client.get_balance()
         if self.dry_run and (bal is None or bal < MIN_BET_USD):
             bal = DRY_RUN_BALANCE
         if bal is None or bal < MIN_BET_USD:
             return 0.0
-        available = bal - BALANCE_RESERVE
 
-        if kelly <= 0:
-            # Kelly says no mathematical edge at this token price.
-            # For high-confidence signals (>60%) with cheap tokens (<0.85),
-            # use minimum bet as override — the signal may still be profitable.
-            if confidence >= 0.60 and token_price <= 0.85:
-                return MIN_BET_USD
+        available = bal - BALANCE_RESERVE
+        if available < MIN_BET_USD:
             return 0.0
 
+        # Apply mode fraction
         kelly *= self.mode_cfg["kelly_fraction"]
         cap = available * self.mode_cfg["max_bet_pct"]
         bet = min(available * kelly, cap, self.max_bet)
         return bet if bet >= MIN_BET_USD else 0.0
+
+    # ── OBI (Order Book Imbalance) ────────────────────────────────────────
+
+    def _get_obi(self, up_token: str, down_token: str, direction: str) -> float:
+        """
+        Order Book Imbalance: ratio of bids on our side vs opposite.
+        OBI > 0.6 = market agrees with us. OBI < 0.4 = market disagrees.
+        Returns OBI for the direction we want to trade (0-1).
+        """
+        try:
+            our_token = up_token if direction == "UP" else down_token
+            our_book = self.client.fetch_book(our_token)
+            opp_token = down_token if direction == "UP" else up_token
+            opp_book = self.client.fetch_book(opp_token)
+
+            our_bid = our_book.get("best_bid", 0)
+            opp_bid = opp_book.get("best_bid", 0)
+
+            if our_bid + opp_bid > 0:
+                return our_bid / (our_bid + opp_bid)
+        except Exception:
+            pass
+        return 0.5  # neutral
 
     # ── Fire ──────────────────────────────────────────────────────────────
 
@@ -128,41 +192,59 @@ class Sniper:
         token = s.up_token if sig.direction == "UP" else s.down_token
         buy_price = self.client.get_buy_price(token, a.max_token_price, a.min_token_price)
 
-        # Retry once after 0.5s if price not available
+        # Retry
         if buy_price <= 0:
-            import time as _t
-            _t.sleep(0.5)
+            time.sleep(0.5)
             buy_price = self.client.get_buy_price(token, a.max_token_price, a.min_token_price)
 
-        # DRY RUN fallback: estimate price from delta (observed pricing model)
+        # DRY RUN fallback: estimate from delta
         if buy_price <= 0 and self.dry_run:
             ad = abs(sig.delta_pct)
             if ad >= 0.15:
-                buy_price = 0.93
+                buy_price = 0.82
             elif ad >= 0.10:
-                buy_price = 0.80
+                buy_price = 0.75
             elif ad >= 0.05:
                 buy_price = 0.65
             elif ad >= 0.02:
                 buy_price = 0.55
             else:
                 buy_price = 0.50
-            print(f"  [{a.name}] [DRY] Estimated price: {buy_price:.2f}"
-                  f" (delta={sig.delta_pct:+.3f}%)")
 
         if buy_price <= 0:
-            print(f"  [{a.name}] [SKIP] No valid price for {sig.direction}")
+            print(f"  [{a.name}] [SKIP] No price for {sig.direction}")
             self.stats.skipped += 1
             return
 
-        bet = self._kelly_bet(sig.confidence, buy_price)
+        # ── Edge detection ────────────────────────────────────────────
+        edge = self.engine.calc_edge(sig, buy_price)
+
+        if edge < MIN_EDGE:
+            print(f"  [{a.name}] [SKIP] Edge {edge:.1%} < {MIN_EDGE:.0%}"
+                  f" (prob={sig.true_prob:.1%} price={buy_price:.2f})")
+            self.stats.skipped += 1
+            return
+
+        # ── OBI filter (soft) ─────────────────────────────────────────
+        obi = self._get_obi(s.up_token, s.down_token, sig.direction)
+        if obi < 0.30:
+            print(f"  [{a.name}] [SKIP] OBI={obi:.2f} — book disagrees")
+            self.stats.skipped += 1
+            return
+
+        # ── Kelly sizing with Brownian true_prob ──────────────────────
+        bet = self._kelly_bet(sig.true_prob, buy_price)
         if bet < MIN_BET_USD:
-            print(f"  [{a.name}] [SKIP] Kelly: no edge"
-                  f" (conf={sig.confidence:.0%} price={buy_price:.2f})")
+            print(f"  [{a.name}] [SKIP] Kelly=0 (prob={sig.true_prob:.1%}"
+                  f" price={buy_price:.2f})")
             self.stats.skipped += 1
             return
 
-        shares = max(bet / buy_price, 5)
+        # Scale up for strong edge
+        if edge >= MIN_EDGE_STRONG:
+            bet = min(bet * 1.5, self.max_bet)
+
+        shares = max(bet / buy_price, 5)  # Polymarket min 5 shares
         cost = shares * buy_price
         roi = ((1.0 - buy_price) / buy_price) * 100
         sl = self._secs_left()
@@ -170,13 +252,15 @@ class Sniper:
         s.fire_side = sig.direction
         s.fire_price = buy_price
         s.fire_shares = shares
-        s.fire_confidence = sig.confidence
+        s.fire_edge = edge
+        s.fire_true_prob = sig.true_prob
         s.best_signal = sig
 
         print(f"\n  [{a.name}] 🎯 FIRE: {sig.direction} @ {buy_price:.2f}"
               f" x {shares:.0f}sh = ${cost:.2f}")
-        print(f"  [{a.name}]    Δ={sig.delta_pct:+.3f}%"
-              f" Conf={sig.confidence:.0%} ROI={roi:.1f}% T-{sl:.0f}s")
+        print(f"  [{a.name}]    P={sig.true_prob:.0%} Edge={edge:.1%}"
+              f" ROI={roi:.1f}% z={sig.z_score:+.2f}"
+              f" OBI={obi:.2f} T-{sl:.0f}s")
 
         if self.dry_run:
             s.order_id = f"DRY-{a.name}-{sig.direction}-{s.window_ts}"
@@ -190,9 +274,9 @@ class Sniper:
             send_telegram(
                 f"🎯 {a.name}: {sig.direction} @ {buy_price:.2f}"
                 f" x {shares:.0f}sh = ${cost:.2f}\n"
-                f"Δ={sig.delta_pct:+.3f}% Conf={sig.confidence:.0%}"
-                f" ROI={roi:.1f}% T-{sl:.0f}s\n"
-                f"{_slug_short(s.slug)} | {self.mode_name}")
+                f"P={sig.true_prob:.0%} Edge={edge:.1%}"
+                f" z={sig.z_score:+.2f} OBI={obi:.2f}\n"
+                f"{_slug_short(s.slug)} T-{sl:.0f}s | {self.mode_name}")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -215,8 +299,6 @@ class Sniper:
             self.state.down_token = market["token_ids"][1]
             self.state.condition_id = market.get("condition_id", "")
             print(f"  [{a.name}] [MARKET] {_slug_short(market['slug'])}")
-        else:
-            print(f"  [{a.name}] [!] Market not found for ts={ts}")
 
     def _on_window_end(self):
         self.stats.windows += 1
@@ -273,13 +355,15 @@ class Sniper:
             if header:
                 w.writerow(["ts", "window", "slug", "side", "mode",
                             "open", "close", "gap", "delta_pct",
-                            "conf", "score", "price", "shares",
-                            "cost", "result", "pnl", "cum_pnl"])
+                            "true_prob", "edge", "z_score",
+                            "price", "shares", "cost",
+                            "result", "pnl", "cum_pnl"])
             w.writerow([now, s.window_ts, _slug_short(s.slug), s.fire_side,
                         self.mode_name, f"{s.open_price:.4f}",
                         f"{close_price:.4f}", f"{gap:+.4f}",
                         f"{s.best_signal.delta_pct:+.4f}",
-                        f"{s.fire_confidence:.2f}", f"{s.best_signal.score:+.1f}",
+                        f"{s.fire_true_prob:.3f}", f"{s.fire_edge:.3f}",
+                        f"{s.best_signal.z_score:+.2f}",
                         f"{s.fire_price:.2f}", f"{s.fire_shares:.0f}",
                         f"{s.fire_shares * s.fire_price:.2f}",
                         result, f"{pnl:.2f}", f"{self.stats.pnl:.2f}"])
@@ -290,14 +374,18 @@ class Sniper:
         a = self.asset
         mode_label = "LIVE" if not self.dry_run else "DRY"
         bal = self.client.get_balance()
+        if bal and bal > 0:
+            self.stats.starting_balance = bal
         bal_s = f"${bal:.2f}" if bal else "n/a"
 
         print(f"\n{'─' * 60}")
-        print(f"  🎯 {a.name} Sniper — {mode_label} {self.mode_name}")
-        print(f"  Δ ≥ {a.min_delta_pct:.3f}% | Conf ≥ {a.min_confidence:.0%}"
-              f" | Token [{a.min_token_price:.2f}, {a.max_token_price:.2f}]")
+        print(f"  🎯 {a.name} Sniper v2 — {mode_label} {self.mode_name}")
+        print(f"  Model: Brownian CDF + Edge ≥ {MIN_EDGE:.0%}")
+        print(f"  σ={self.engine.sigma*100:.2f}% | Kelly {self.mode_cfg['kelly_fraction']:.0%}"
+              f" | Drawdown stop: {DRAWDOWN_LIMIT:.0%}")
         print(f"  Eval T-{a.eval_start_secs}→T-{a.eval_end_secs}"
-              f" | Binance: {a.binance_symbol} | Bal: {bal_s}")
+              f" | Token [{a.min_token_price:.2f}, {a.max_token_price:.2f}]"
+              f" | Bal: {bal_s}")
         print(f"{'─' * 60}")
 
         self.running = True
@@ -316,6 +404,11 @@ class Sniper:
                 last_ts = cur_ts
                 self._on_window_start()
 
+            # Drawdown check
+            if self._check_drawdown():
+                time.sleep(5)
+                continue
+
             if not s.open_captured and sl > WINDOW_SECS - 10:
                 p = self.client.fetch_price(a.binance_symbol)
                 if p > 0:
@@ -330,42 +423,29 @@ class Sniper:
                     last_tick = now
                     if p > 0:
                         self.engine.add_tick(p, now)
-                        sig = self.engine.analyze(s.open_price, p)
+                        sig = self.engine.analyze(s.open_price, p, sl)
 
-                        if abs(sig.score) > abs(s.best_signal.score):
+                        if sig.true_prob > s.best_signal.true_prob:
                             s.best_signal = sig
 
                         d = "▲" if sig.direction == "UP" else "▼" if sig.direction == "DOWN" else "━"
-                        print(f"  [{a.name}] {d} ${p:,.4f}"
+                        print(f"  [{a.name}] {d} ${p:,.2f}"
+                              f" P={sig.true_prob:.0%}"
+                              f" z={sig.z_score:+.2f}"
                               f" Δ={sig.delta_pct:+.3f}%"
-                              f" S={sig.score:+.1f}"
-                              f" C={sig.confidence:.0%}"
                               f" T-{sl:.0f}s", end="\r")
 
-                        ad = abs(sig.delta_pct)
-                        fire = False
-
-                        if (ad >= a.min_delta_pct
-                                and sig.confidence >= a.min_confidence
-                                and abs(sig.score) >= 3.0):
-                            fire = True
-
-                        if (abs(sig.score) >= 3.0
-                                and abs(sig.score - s.prev_score) >= 1.5
-                                and ad >= a.min_delta_pct):
-                            fire = True
-
-                        if (sl <= a.eval_end_secs + 2
-                                and abs(s.best_signal.score) >= 2.5
-                                and abs(s.best_signal.delta_pct) >= a.min_delta_pct):
-                            sig = s.best_signal
-                            fire = True
-
-                        s.prev_score = sig.score
-                        if fire:
-                            print(f"\n  [{a.name}] [TRIGGER] S={sig.score:+.1f}"
-                                  f" C={sig.confidence:.0%} Δ={sig.delta_pct:+.3f}%")
+                        # Fire condition: prob > 55% AND edge will be checked in _fire
+                        if sig.true_prob >= 0.55 and abs(sig.delta_pct) >= a.min_delta_pct:
+                            print(f"\n  [{a.name}] [EVAL] P={sig.true_prob:.0%}"
+                                  f" z={sig.z_score:+.2f}")
                             self._fire(sig)
+
+                        # Deadline: use best signal at T-end+2
+                        elif (sl <= a.eval_end_secs + 2
+                              and s.best_signal.true_prob >= 0.58):
+                            print(f"\n  [{a.name}] [DEADLINE] P={s.best_signal.true_prob:.0%}")
+                            self._fire(s.best_signal)
 
             elif not in_eval and not s.fired and sl > a.eval_start_secs:
                 if now - last_tick >= 2.0:
@@ -374,8 +454,8 @@ class Sniper:
                     if p > 0 and s.open_captured:
                         g = p - s.open_price
                         d = "▲" if g > 0 else "▼" if g < 0 else "━"
-                        print(f"  [{a.name}] {d} ${p:,.4f}"
-                              f" Gap={g:+,.4f}"
+                        print(f"  [{a.name}] {d} ${p:,.2f}"
+                              f" Gap={g:+,.2f}"
                               f" Eval in {sl - a.eval_start_secs:.0f}s",
                               end="\r")
 
