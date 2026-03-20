@@ -248,6 +248,14 @@ class Sniper:
             result = "WIN"
             print(f"  [{a.name}] ✅ WIN: {s.fire_side} → +${profit:.2f}"
                   f" | {a.name}: ${close_price:,.4f} ({gap:+,.4f})")
+
+            # Auto-sell winning tokens at $0.99 to recycle back to USDC
+            if not self.dry_run:
+                token = s.up_token if s.fire_side == "UP" else s.down_token
+                time.sleep(2)  # wait for settlement
+                self.client.submit_sell(
+                    token, 0.99, s.fire_shares,
+                    f"{a.name}-{s.fire_side}-CLAIM")
         else:
             loss = round(s.fire_shares * s.fire_price, 2)
             self.stats.losses += 1

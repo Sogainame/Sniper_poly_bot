@@ -213,3 +213,28 @@ class PolymarketClient:
                 if attempt < MAX_ORDER_RETRIES:
                     time.sleep(RETRY_DELAY)
         return None
+
+    def submit_sell(self, token_id: str, price: float, size: float,
+                    label: str) -> str | None:
+        """
+        Sell winning tokens back to USDC.
+        After a win, tokens are worth ~$1.00. Sell at $0.99 to
+        convert back to cash instantly (~$0.01/share fee).
+        Based on gengar_polymarket_bot auto-claim approach.
+        """
+        from py_clob_client.order_builder.constants import SELL
+        for attempt in range(1, MAX_ORDER_RETRIES + 1):
+            try:
+                args = OrderArgs(token_id=token_id, price=round(price, 2),
+                                 size=round(size, 1), side=SELL)
+                signed = self.clob.create_order(args)
+                resp = self.clob.post_order(signed, OrderType.GTC)
+                oid = resp.get("orderID") if isinstance(resp, dict) else None
+                print(f"  [SELL] {label} @ {price:.2f} x {size:.0f}sh"
+                      f" | ID: {oid or '?'}")
+                return oid
+            except Exception as e:
+                print(f"  [!] Sell attempt {attempt}: {e}")
+                if attempt < MAX_ORDER_RETRIES:
+                    time.sleep(RETRY_DELAY)
+        return None
