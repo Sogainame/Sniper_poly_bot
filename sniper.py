@@ -252,10 +252,23 @@ class Sniper:
             # Auto-sell winning tokens at $0.99 to recycle back to USDC
             if not self.dry_run:
                 token = s.up_token if s.fire_side == "UP" else s.down_token
-                time.sleep(2)  # wait for settlement
-                self.client.submit_sell(
+                time.sleep(3)  # wait for settlement
+
+                # Update conditional token allowance before sell
+                try:
+                    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                    self.client.clob.update_balance_allowance(
+                        BalanceAllowanceParams(
+                            asset_type=AssetType.CONDITIONAL,
+                            token_id=token))
+                except Exception:
+                    pass
+
+                sell_id = self.client.submit_sell(
                     token, 0.99, s.fire_shares,
                     f"{a.name}-{s.fire_side}-CLAIM")
+                if not sell_id:
+                    print(f"  [{a.name}] [!] Sell failed — tokens may not have filled")
         else:
             loss = round(s.fire_shares * s.fire_price, 2)
             self.stats.losses += 1
