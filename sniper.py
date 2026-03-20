@@ -183,11 +183,16 @@ class Sniper:
         if self.dry_run:
             s.order_id = f"DRY-{a.name}-{sig.direction}-{s.window_ts}"
             print(f"  [{a.name}] [DRY] Would MAKER BUY {sig.direction}")
+            self.stats.fired += 1
         else:
             s.order_id = self.client.submit_maker_buy(
                 token, buy_price, shares, f"{a.name}-{sig.direction}")
-
-        self.stats.fired += 1
+            if s.order_id:
+                self.stats.fired += 1
+            else:
+                print(f"  [{a.name}] [!] Order failed — unfiring window")
+                s.fired = False
+                return
         if not self.dry_run:
             send_telegram(
                 f"🎯 {a.name}: {sig.direction} @ {buy_price:.2f}"

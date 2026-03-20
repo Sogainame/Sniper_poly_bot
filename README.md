@@ -10,7 +10,9 @@ Based on research of real trading results and open-source bots:
 - **Maker GTC orders**: 0% taker fee + maker rebates
 - **Kelly criterion**: position sizing based on edge and confidence
 - **Per-asset tuning**: each coin has individual delta/confidence thresholds based on observed volatility and liquidity
-- **Eval window T-60 → T-10**: enter when token is still $0.55-0.70, not $0.95+
+- **Eval window**: BTC T-60→T-20, others T-150..170→T-30
+- **Result check**: Polymarket token midpoints (Chainlink resolution source), not Binance
+- **Early exit**: sells position if token price rises +$0.10 before window closes
 
 ## Asset Profiles
 
