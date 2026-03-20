@@ -273,10 +273,13 @@ class Sniper:
             s.order_id = f"DRY-{a.name}-{sig.direction}-{s.window_ts}"
             print(f"  [{a.name}] [DRY] Would FOK BUY {sig.direction} ${cost:.2f}")
         else:
-            # FOK: fill instantly or cancel. amount = dollars to spend.
-            # max_price = slippage protection (buy_price already capped by max_token_price)
+            # FOK: amount = dollars to spend
+            # price = worst acceptable price (slippage protection)
+            # Use buy_price + 0.03 slippage to ensure fill
+            # Edge filter already rejected bad trades, so this is safe
+            slippage_price = min(buy_price + 0.03, 0.97)
             s.order_id = self.client.submit_fok_buy(
-                token, cost, buy_price, f"{a.name}-{sig.direction}")
+                token, cost, slippage_price, f"{a.name}-{sig.direction}")
 
         self.stats.fired += 1
         if not self.dry_run:
