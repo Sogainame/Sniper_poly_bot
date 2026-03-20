@@ -95,9 +95,6 @@ class Sniper:
         win_prob = min(0.50 + confidence * 0.30, 0.90)
         b = (1.0 / token_price) - 1.0
         kelly = (b * win_prob - (1.0 - win_prob)) / b
-        if kelly <= 0:
-            return 0.0
-        kelly *= self.mode_cfg["kelly_fraction"]
 
         bal = self.client.get_balance()
         if self.dry_run and (bal is None or bal < MIN_BET_USD):
@@ -105,6 +102,16 @@ class Sniper:
         if bal is None or bal < MIN_BET_USD:
             return 0.0
         available = bal - BALANCE_RESERVE
+
+        if kelly <= 0:
+            # Kelly says no mathematical edge at this token price.
+            # For high-confidence signals (>60%) with cheap tokens (<0.85),
+            # use minimum bet as override — the signal may still be profitable.
+            if confidence >= 0.60 and token_price <= 0.85:
+                return MIN_BET_USD
+            return 0.0
+
+        kelly *= self.mode_cfg["kelly_fraction"]
         cap = available * self.mode_cfg["max_bet_pct"]
         bet = min(available * kelly, cap, self.max_bet)
         return bet if bet >= MIN_BET_USD else 0.0
@@ -120,6 +127,29 @@ class Sniper:
 
         token = s.up_token if sig.direction == "UP" else s.down_token
         buy_price = self.client.get_buy_price(token, a.max_token_price, a.min_token_price)
+
+        # Retry once after 0.5s if price not available
+        if buy_price <= 0:
+            import time as _t
+            _t.sleep(0.5)
+            buy_price = self.client.get_buy_price(token, a.max_token_price, a.min_token_price)
+
+        # DRY RUN fallback: estimate price from delta (observed pricing model)
+        if buy_price <= 0 and self.dry_run:
+            ad = abs(sig.delta_pct)
+            if ad >= 0.15:
+                buy_price = 0.93
+            elif ad >= 0.10:
+                buy_price = 0.80
+            elif ad >= 0.05:
+                buy_price = 0.65
+            elif ad >= 0.02:
+                buy_price = 0.55
+            else:
+                buy_price = 0.50
+            print(f"  [{a.name}] [DRY] Estimated price: {buy_price:.2f}"
+                  f" (delta={sig.delta_pct:+.3f}%)")
+
         if buy_price <= 0:
             print(f"  [{a.name}] [SKIP] No valid price for {sig.direction}")
             self.stats.skipped += 1
@@ -127,7 +157,8 @@ class Sniper:
 
         bet = self._kelly_bet(sig.confidence, buy_price)
         if bet < MIN_BET_USD:
-            print(f"  [{a.name}] [SKIP] Kelly: no edge")
+            print(f"  [{a.name}] [SKIP] Kelly: no edge"
+                  f" (conf={sig.confidence:.0%} price={buy_price:.2f})")
             self.stats.skipped += 1
             return
 
