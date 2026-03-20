@@ -1,14 +1,5 @@
-"""
-Core Sniper engine — runs one asset at a time.
-Takes AssetConfig for per-asset thresholds.
-
-Step 3 changes:
-- removes fake Kelly sizing (there is no calibrated win probability yet)
-- adds a deterministic risk ladder based on signal quality
-- adds alignment checks so the bot avoids firing on internally contradictory signals
-- requires confirmation across ticks, not just one noisy score spike
-- tightens late-window fallback so weak end-of-window guesses do not fire
-"""
+"""Core sniper engine."""
+from __future__ import annotations
 
 import csv
 import time
@@ -17,46 +8,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from assets import AssetConfig
-from signal_engine import Signal, SignalEngine
 from market import PolymarketClient
 from notifier import send_telegram
+from signal_engine import Signal, SignalEngine
 
 WINDOW_SECS = 300
 DRY_RUN_BALANCE = 20.0
 MIN_BET_USD = 1.0
 BALANCE_RESERVE = 0.50
-EARLY_EXIT_GAIN = 0.10
-MIN_SCORE_TO_FIRE = 3.5
-STRONG_SCORE_TO_FIRE = 5.5
-MIN_CONFIRM_TICKS = 2
-
-MODES = {
-    "safe": {
-        "min_risk_pct": 0.03,
-        "max_risk_pct": 0.08,
-        "hard_cap_pct": 0.12,
-        "label": "Safe",
-    },
-    "aggressive": {
-        "min_risk_pct": 0.05,
-        "max_risk_pct": 0.14,
-        "hard_cap_pct": 0.20,
-        "label": "Aggressive",
-    },
-    "degen": {
-        "min_risk_pct": 0.08,
-        "max_risk_pct": 0.22,
-        "hard_cap_pct": 0.30,
-        "label": "Degen",
-    },
-}
-
 CSV_DIR = Path("data/sniper")
 
-
-def _slug_short(slug: str) -> str:
-    parts = slug.split("-updown-")
-    return parts[-1] if len(parts) > 1 else slug
+MODES = {
+    "safe": {"risk_scale": 0.25, "max_bet_pct": 0.18, "label": "Safe"},
+    "aggressive": {"risk_scale": 0.50, "max_bet_pct": 0.30, "label": "Aggressive"},
+    "degen": {"risk_scale": 1.00, "max_bet_pct": 0.45, "label": "Degen"},
+}
 
 
 @dataclass
@@ -67,19 +33,19 @@ class WindowState:
     down_token: str = ""
     condition_id: str = ""
     open_price: float = 0.0
-    open_captured: bool = False
     best_signal: Signal = field(default_factory=Signal)
     prev_score: float = 0.0
     fired: bool = False
     fire_side: str = ""
+    fire_token: str = ""
     fire_price: float = 0.0
     fire_shares: float = 0.0
     fire_confidence: float = 0.0
+    fire_stake_usd: float = 0.0
     order_id: str | None = None
     early_sold: bool = False
-    confirm_ticks: int = 0
-    last_direction: str = ""
-    last_quality: float = 0.0
+    early_sell_price: float = 0.0
+    early_sell_order_id: str | None = None
 
 
 @dataclass
@@ -89,18 +55,24 @@ class Stats:
     skipped: int = 0
     wins: int = 0
     losses: int = 0
+    flats: int = 0
     pnl: float = 0.0
 
 
 class Sniper:
-
-    def __init__(self, asset: AssetConfig, client: PolymarketClient,
-                 dry_run: bool = True, mode: str = "safe", max_bet: float = 50.0):
+    def __init__(
+        self,
+        asset: AssetConfig,
+        client: PolymarketClient,
+        dry_run: bool = True,
+        mode: str = "safe",
+        max_bet: float = 50.0,
+    ) -> None:
         self.asset = asset
         self.client = client
         self.dry_run = dry_run
-        self.mode_cfg = MODES[mode]
         self.mode_name = mode
+        self.mode_cfg = MODES[mode]
         self.max_bet = max_bet
         self.engine = SignalEngine()
         self.state = WindowState()
@@ -108,493 +80,299 @@ class Sniper:
         self.running = False
         CSV_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Timing ────────────────────────────────────────────────────────────
+    def _window_ts(self, now: float | None = None) -> int:
+        now_ts = time.time() if now is None else now
+        return int(now_ts - (now_ts % WINDOW_SECS))
 
-    def _window_ts(self) -> int:
-        now = time.time()
-        return int(now - (now % WINDOW_SECS))
+    def _secs_left(self, now: float | None = None) -> float:
+        now_ts = time.time() if now is None else now
+        return self._window_ts(now_ts) + WINDOW_SECS - now_ts
 
-    def _secs_left(self) -> float:
-        return self._window_ts() + WINDOW_SECS - time.time()
-
-    # ── Signal gating / sizing ────────────────────────────────────────────
-
-    def _available_balance(self) -> float:
+    def _balance(self) -> float:
         bal = self.client.get_balance()
         if self.dry_run and (bal is None or bal < MIN_BET_USD):
-            bal = DRY_RUN_BALANCE
-        if bal is None:
+            return DRY_RUN_BALANCE
+        return bal or 0.0
+
+    def _stake_usd(self, confidence: float, token_price: float) -> float:
+        bal = self._balance()
+        available = max(bal - BALANCE_RESERVE, 0.0)
+        if available < MIN_BET_USD:
             return 0.0
-        return max(0.0, bal - BALANCE_RESERVE)
+        if token_price <= 0 or token_price >= 0.99:
+            return 0.0
 
-    def _signal_alignment_ok(self, sig: Signal) -> bool:
-        if sig.direction not in ("UP", "DOWN"):
-            return False
+        edge_proxy = max(confidence - self.asset.min_confidence, 0.0)
+        if edge_proxy <= 0:
+            return 0.0
 
-        sign = 1.0 if sig.direction == "UP" else -1.0
-        mom = sig.components.get("mom", 0.0) * sign
-        acc = sig.components.get("acc", 0.0) * sign
-        cons = sig.components.get("cons", 0.0) * sign
+        payout_ratio = max((1.0 - token_price) / max(token_price, 1e-6), 0.0)
+        payout_scale = min(max(payout_ratio / 0.6, 0.50), 1.35)
+        raw_fraction = (0.06 + edge_proxy * 0.45) * self.mode_cfg["risk_scale"] * payout_scale
+        capped_fraction = min(raw_fraction, self.mode_cfg["max_bet_pct"])
+        stake = min(self.max_bet, available * capped_fraction)
+        return round(stake if stake >= MIN_BET_USD else 0.0, 2)
 
-        # If supporting components actively disagree with the trade direction,
-        # skip the trade unless the total score is very strong.
-        if mom < -0.5:
+    def _reset_window(self, window_ts: int, open_price: float) -> None:
+        self.engine.reset()
+        self.state = WindowState(window_ts=window_ts, open_price=open_price)
+        self.stats.windows += 1
+
+    def _ensure_market(self) -> bool:
+        if self.state.slug:
+            return True
+        market = self.client.find_market(self.asset.slug_prefix, self.state.window_ts)
+        if not market:
             return False
-        if cons < -0.25:
+        self.state.slug = market["slug"]
+        self.state.condition_id = market.get("condition_id", "")
+        self.state.up_token = market.get("up_token", "")
+        self.state.down_token = market.get("down_token", "")
+        return bool(self.state.up_token and self.state.down_token)
+
+    def _confirm_direction(self, direction: str) -> bool:
+        required = max(self.asset.confirm_ticks, 2)
+        if len(self.engine.tick_prices) < required:
             return False
-        if acc < -0.75 and abs(sig.score) < STRONG_SCORE_TO_FIRE:
+        recent = self.engine.tick_prices[-required:]
+        deltas = [recent[i + 1] - recent[i] for i in range(len(recent) - 1)]
+        if direction == "UP":
+            return all(delta > 0 for delta in deltas)
+        if direction == "DOWN":
+            return all(delta < 0 for delta in deltas)
+        return False
+
+    def _should_fire(self, sig: Signal, secs_left: float) -> bool:
+        if self.state.fired:
+            return False
+        if not sig.direction:
+            return False
+        if abs(sig.delta_pct) < self.asset.min_delta_pct:
+            return False
+        if sig.confidence < self.asset.min_confidence:
+            return False
+        if sig.score <= self.state.prev_score + self.asset.min_score_gap:
+            return False
+        if secs_left > self.asset.eval_start_secs or secs_left < self.asset.eval_end_secs:
+            return False
+        if not self._confirm_direction(sig.direction):
             return False
         return True
 
-    def _signal_quality(self, sig: Signal) -> float:
-        a = self.asset
-        if sig.direction not in ("UP", "DOWN"):
-            return 0.0
+    def _entry_token(self, direction: str) -> str:
+        return self.state.up_token if direction == "UP" else self.state.down_token
 
-        score_q = min(max((abs(sig.score) - MIN_SCORE_TO_FIRE) / 4.0, 0.0), 1.0)
-        conf_floor = max(a.min_confidence, 0.20)
-        conf_q = min(max((sig.confidence - conf_floor) / max(1e-6, 1.0 - conf_floor), 0.0), 1.0)
-        delta_floor = max(a.min_delta_pct, 1e-6)
-        delta_q = min(max((abs(sig.delta_pct) - delta_floor) / (3.0 * delta_floor), 0.0), 1.0)
+    def _fire_trade(self, sig: Signal) -> bool:
+        token_id = self._entry_token(sig.direction)
+        if not token_id:
+            return False
 
-        quality = 0.45 * score_q + 0.35 * conf_q + 0.20 * delta_q
-        if self._signal_alignment_ok(sig):
-            quality += 0.10
-        else:
-            quality -= 0.30
-        return min(max(quality, 0.0), 1.0)
+        book = self.client.fetch_book(token_id)
+        if book.spread > self.asset.max_spread:
+            return False
 
-    def _stake_size(self, sig: Signal, token_price: float) -> float:
-        a = self.asset
-        if token_price <= 0.01 or token_price >= 0.99:
-            return 0.0
-
-        available = self._available_balance()
-        if available < MIN_BET_USD:
-            return 0.0
-
-        quality = self._signal_quality(sig)
-        if quality < 0.20:
-            return 0.0
-
-        risk_pct = self.mode_cfg["min_risk_pct"] + quality * (
-            self.mode_cfg["max_risk_pct"] - self.mode_cfg["min_risk_pct"]
+        price = self.client.get_buy_price(
+            token_id,
+            max_price=self.asset.max_token_price,
+            min_price=self.asset.min_token_price,
         )
-
-        # Penalize expensive contracts unless the signal is genuinely strong.
-        if token_price >= min(0.82, a.max_token_price) and quality < 0.55:
-            risk_pct *= 0.5
-
-        # Penalize signals that only barely exceed the minimum delta filter.
-        if abs(sig.delta_pct) < a.min_delta_pct * 1.25:
-            risk_pct *= 0.6
-
-        bet = min(
-            self.max_bet,
-            available * self.mode_cfg["hard_cap_pct"],
-            available * risk_pct,
-        )
-        return bet if bet >= MIN_BET_USD else 0.0
-
-    def _update_confirmation(self, sig: Signal):
-        s = self.state
-        a = self.asset
-        basic_ok = (
-            sig.direction in ("UP", "DOWN")
-            and abs(sig.delta_pct) >= a.min_delta_pct
-            and sig.confidence >= a.min_confidence
-            and abs(sig.score) >= MIN_SCORE_TO_FIRE
-            and self._signal_alignment_ok(sig)
-        )
-
-        if not basic_ok:
-            s.confirm_ticks = 0
-            s.last_direction = ""
-            s.last_quality = 0.0
-            return
-
-        quality = self._signal_quality(sig)
-        if sig.direction == s.last_direction and quality >= s.last_quality * 0.80:
-            s.confirm_ticks += 1
-        else:
-            s.confirm_ticks = 1
-        s.last_direction = sig.direction
-        s.last_quality = quality
-
-    def _should_fire(self, sig: Signal, secs_left: float) -> bool:
-        a = self.asset
-        if sig.direction not in ("UP", "DOWN"):
-            return False
-        if abs(sig.delta_pct) < a.min_delta_pct:
-            return False
-        if sig.confidence < a.min_confidence:
-            return False
-        if abs(sig.score) < MIN_SCORE_TO_FIRE:
-            return False
-        if not self._signal_alignment_ok(sig):
+        if price <= 0:
             return False
 
-        quality = self._signal_quality(sig)
-        strong = quality >= 0.65 and abs(sig.score) >= STRONG_SCORE_TO_FIRE
-        confirmed = self.state.confirm_ticks >= MIN_CONFIRM_TICKS and quality >= 0.30
-        late_strong = (
-            secs_left <= a.eval_end_secs + 6
-            and self.state.confirm_ticks >= 1
-            and quality >= 0.50
-            and abs(sig.score) >= 4.5
-        )
-        return strong or confirmed or late_strong
+        stake = self._stake_usd(sig.confidence, price)
+        if stake <= 0:
+            return False
+        shares = round(stake / price, 4)
+        if shares <= 0:
+            return False
 
-    # ── Fire ──────────────────────────────────────────────────────────────
-
-    def _fire(self, sig: Signal):
-        s = self.state
-        if s.fired:
-            return
-        a = self.asset
-
-        token = s.up_token if sig.direction == "UP" else s.down_token
-        buy_price = self.client.get_buy_price(token, a.max_token_price, a.min_token_price)
-
-        # Retry once after 0.5s if price not available
-        if buy_price <= 0:
-            time.sleep(0.5)
-            buy_price = self.client.get_buy_price(token, a.max_token_price, a.min_token_price)
-
-        if buy_price <= 0:
-            print(f"  [{a.name}] [SKIP] No executable ask for {sig.direction}")
-            self.stats.skipped += 1
-            return
-
-        bet = self._stake_size(sig, buy_price)
-        if bet < MIN_BET_USD:
-            print(f"  [{a.name}] [SKIP] No-trade zone"
-                  f" (score={sig.score:+.1f} conf={sig.confidence:.0%}"
-                  f" price={buy_price:.2f} q={self._signal_quality(sig):.2f})")
-            self.stats.skipped += 1
-            return
-
-        # All checks passed — NOW lock the window
-        s.fired = True
-
-        shares = max(bet / buy_price, 5)
-        cost = shares * buy_price
-        roi = ((1.0 - buy_price) / buy_price) * 100
-        sl = self._secs_left()
-        quality = self._signal_quality(sig)
-
-        s.fire_side = sig.direction
-        s.fire_price = buy_price
-        s.fire_shares = shares
-        s.fire_confidence = sig.confidence
-        s.best_signal = sig
-
-        print(f"\n  [{a.name}] 🎯 FIRE: {sig.direction} @ {buy_price:.2f}"
-              f" x {shares:.0f}sh = ${cost:.2f}")
-        print(f"  [{a.name}]    Δ={sig.delta_pct:+.3f}%"
-              f" Conf={sig.confidence:.0%} Score={sig.score:+.1f}"
-              f" Q={quality:.2f} ROI={roi:.1f}% T-{sl:.0f}s")
-
-        if self.dry_run:
-            s.order_id = f"DRY-{a.name}-{sig.direction}-{s.window_ts}"
-            print(f"  [{a.name}] [DRY] Would TAKER BUY {sig.direction}")
-            self.stats.fired += 1
-        else:
-            s.order_id = self.client.submit_maker_buy(
-                token, buy_price, shares, f"{a.name}-{sig.direction}")
-            if s.order_id:
-                self.stats.fired += 1
-                bal = self.client.get_balance()
-                if bal is not None:
-                    print(f"  [{a.name}]    💰 Balance: ${bal:.2f}")
-            else:
-                print(f"  [{a.name}] [!] Order failed — unfiring window")
-                s.fired = False
-                return
+        order_id = "dry-run"
         if not self.dry_run:
-            send_telegram(
-                f"🎯 {a.name}: {sig.direction} @ {buy_price:.2f}"
-                f" x {shares:.0f}sh = ${cost:.2f}\n"
-                f"Δ={sig.delta_pct:+.3f}% Conf={sig.confidence:.0%}"
-                f" Score={sig.score:+.1f} Q={quality:.2f}"
-                f" ROI={roi:.1f}% T-{sl:.0f}s\n"
-                f"{_slug_short(s.slug)} | {self.mode_name}")
+            order_id = self.client.submit_maker_buy(token_id, price, shares, f"{self.asset.name} {sig.direction}")
+            if not order_id:
+                return False
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────
+        self.state.fired = True
+        self.state.fire_side = sig.direction
+        self.state.fire_token = token_id
+        self.state.fire_price = price
+        self.state.fire_shares = shares
+        self.state.fire_confidence = sig.confidence
+        self.state.fire_stake_usd = stake
+        self.state.order_id = order_id
+        self.stats.fired += 1
 
-    def _on_window_start(self):
-        ts = self._window_ts()
-        self.state = WindowState(window_ts=ts)
-        self.engine.reset()
-        a = self.asset
+        msg = (
+            f"🎯 {self.asset.name} {sig.direction} | entry={price:.3f} | shares={shares:.4f} | "
+            f"stake=${stake:.2f} | conf={sig.confidence:.2f} | delta={sig.delta_pct:.4f}%"
+        )
+        print(msg)
+        send_telegram(msg)
+        return True
 
-        price = self.client.fetch_price(a.binance_symbol)
-        if price > 0:
-            self.state.open_price = price
-            self.state.open_captured = True
-            t_start = datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M")
-            t_end = datetime.fromtimestamp(ts + WINDOW_SECS, timezone.utc).strftime("%H:%M UTC")
-            print(f"\n  [{a.name}] ── {t_start}-{t_end} ── {a.name}: ${price:,.2f}")
-
-        market = self.client.find_market(a.slug_prefix, ts)
-        if market:
-            self.state.slug = market["slug"]
-            self.state.up_token = market["up_token"]
-            self.state.down_token = market["down_token"]
-            self.state.condition_id = market.get("condition_id", "")
-        else:
-            print(f"  [{a.name}] [!] Market not found for ts={ts}")
-
-    def _on_window_end(self):
-        self.stats.windows += 1
+    def _maybe_early_exit(self) -> None:
         if not self.state.fired or self.state.early_sold:
             return
-        time.sleep(3)
-        self._check_result()
-
-    def _check_result(self):
-        s = self.state
-        a = self.asset
-        if not s.fire_side:
+        bid = self.client.get_sell_price(self.state.fire_token)
+        if bid <= 0:
+            return
+        if bid - self.state.fire_price < self.asset.early_exit_profit:
             return
 
-        up_mid = self.client.fetch_midpoint(s.up_token)
-        down_mid = self.client.fetch_midpoint(s.down_token)
-
-        if up_mid > 0.01 or down_mid > 0.01:
-            if up_mid > down_mid:
-                actual = "UP"
-            elif down_mid > up_mid:
-                actual = "DOWN"
-            else:
-                actual = ""
-            won = (s.fire_side == actual) if actual else False
-        else:
-            close_price = self.client.fetch_price(a.binance_symbol)
-            gap = close_price - s.open_price if close_price > 0 else 0
-            actual = "UP" if gap >= 0 else "DOWN"
-            won = (s.fire_side == actual)
-
-        close_price = self.client.fetch_price(a.binance_symbol)
-        gap = close_price - s.open_price if close_price > 0 else 0
-
-        if won:
-            profit = round(s.fire_shares * (1.0 - s.fire_price) * 0.98, 2)
-            self.stats.wins += 1
-            self.stats.pnl += profit
-            result = "WIN"
-            print(f"  [{a.name}] ✅ WIN: {s.fire_side}"
-                  f" | bought {s.fire_shares:.0f}sh @ ${s.fire_price:.2f}"
-                  f" → payout ${s.fire_shares:.0f} × $1.00 = +${profit:.2f}")
-            print(f"  [{a.name}]    UP=${up_mid:.2f} DOWN=${down_mid:.2f}"
-                  f" → resolved: {actual}")
-
-            if not self.dry_run:
-                token = s.up_token if s.fire_side == "UP" else s.down_token
-                time.sleep(3)
-
-                try:
-                    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-                    self.client.clob.update_balance_allowance(
-                        BalanceAllowanceParams(
-                            asset_type=AssetType.CONDITIONAL,
-                            token_id=token))
-                except Exception:
-                    pass
-
-                sell_price = self.client.get_sell_price(token)
-                if sell_price < 0.90:
-                    sell_price = 0.99
-                sell_id = self.client.submit_sell(
-                    token, sell_price, s.fire_shares,
-                    f"{a.name}-{s.fire_side}-CLAIM")
-                if sell_id:
-                    print(f"  [{a.name}]    💰 Sold tokens → USDC recycled")
-                else:
-                    print(f"  [{a.name}]    ⚠ Sell failed — check positions manually")
-        else:
-            loss = round(s.fire_shares * s.fire_price, 2)
-            self.stats.losses += 1
-            self.stats.pnl -= loss
-            profit = -loss
-            result = "LOSS"
-            print(f"  [{a.name}] ❌ LOSS: {s.fire_side}"
-                  f" | bought {s.fire_shares:.0f}sh @ ${s.fire_price:.2f}"
-                  f" → resolved {actual} = -${loss:.2f}")
-            print(f"  [{a.name}]    UP=${up_mid:.2f} DOWN=${down_mid:.2f}")
-
+        order_id = "dry-run"
         if not self.dry_run:
-            bal = self.client.get_balance()
-            bal_str = f"${bal:.2f}" if bal else "?"
-            print(f"  [{a.name}]    📊 W/L={self.stats.wins}/{self.stats.losses}"
-                  f" PnL=${self.stats.pnl:+.2f} Cash={bal_str}")
-            send_telegram(
-                f"{'✅' if won else '❌'} {a.name} {result}:"
-                f" {s.fire_side} ${profit:+.2f}"
-                f"\nW/L={self.stats.wins}/{self.stats.losses}"
-                f" PnL=${self.stats.pnl:+.2f}")
+            order_id = self.client.submit_sell(
+                self.state.fire_token,
+                bid,
+                self.state.fire_shares,
+                f"{self.asset.name} {self.state.fire_side}",
+            )
+            if not order_id:
+                return
+
+        self.state.early_sold = True
+        self.state.early_sell_price = bid
+        self.state.early_sell_order_id = order_id
+        pnl = (bid - self.state.fire_price) * self.state.fire_shares
+        self.stats.pnl += pnl
+        text = f"💸 {self.asset.name} early-exit @ {bid:.3f} | pnl=${pnl:+.2f}"
+        print(text)
+        send_telegram(text)
+
+    def _reference_resolution(self, close_price: float) -> str:
+        if close_price > self.state.open_price:
+            return "UP"
+        if close_price < self.state.open_price:
+            return "DOWN"
+        return "FLAT"
+
+    def _log_trade(
+        self,
+        *,
+        resolved_side: str,
+        close_price: float,
+        exit_price: float,
+        result: str,
+        resolved_by: str,
+        pnl: float,
+    ) -> None:
+        path = CSV_DIR / f"{self.asset.slug_prefix}.csv"
+        is_new = not path.exists()
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "asset": self.asset.name,
+            "slug": self.state.slug,
+            "window_ts": self.state.window_ts,
+            "open_price": round(self.state.open_price, 8),
+            "close_price": round(close_price, 8),
+            "side": self.state.fire_side,
+            "resolved_side": resolved_side,
+            "result": result,
+            "resolved_by": resolved_by,
+            "entry_price": round(self.state.fire_price, 4),
+            "exit_price": round(exit_price, 4),
+            "shares": round(self.state.fire_shares, 4),
+            "stake_usd": round(self.state.fire_stake_usd, 4),
+            "confidence": round(self.state.fire_confidence, 4),
+            "order_id": self.state.order_id or "",
+            "early_sold": int(self.state.early_sold),
+            "pnl": round(pnl, 6),
+        }
+        with path.open("a", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(row.keys()))
+            if is_new:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def _finalize_previous_window(self, close_price: float) -> None:
+        if self.state.window_ts == 0:
+            return
+
+        if not self.state.fired:
+            self.stats.skipped += 1
+            return
+
+        if self.state.early_sold:
+            self._log_trade(
+                resolved_side="EARLY_EXIT",
+                close_price=close_price,
+                exit_price=self.state.early_sell_price,
+                result="EARLY_EXIT",
+                resolved_by="best_bid",
+                pnl=(self.state.early_sell_price - self.state.fire_price) * self.state.fire_shares,
+            )
+            return
+
+        resolved_side = self.client.get_market_resolution(self.state.slug) if self.state.slug else None
+        resolved_by = "market_winner" if resolved_side else "reference_price"
+        if not resolved_side:
+            resolved_side = self._reference_resolution(close_price)
+
+        if resolved_side == "FLAT":
+            exit_price = self.client.fetch_midpoint(self.state.fire_token) or self.client.get_sell_price(self.state.fire_token)
+            pnl = (exit_price - self.state.fire_price) * self.state.fire_shares if exit_price > 0 else 0.0
+            self.stats.flats += 1
+            result = "FLAT"
+        elif resolved_side == self.state.fire_side:
+            exit_price = 1.0
+            pnl = (1.0 - self.state.fire_price) * self.state.fire_shares
+            self.stats.wins += 1
+            result = "WIN"
         else:
-            print(f"  [{a.name}]    📊 W/L={self.stats.wins}/{self.stats.losses}"
-                  f" PnL=${self.stats.pnl:+.2f}")
-        self._log(result, profit, close_price, gap)
+            exit_price = 0.0
+            pnl = -self.state.fire_price * self.state.fire_shares
+            self.stats.losses += 1
+            result = "LOSS"
 
-    def _log(self, result, pnl, close_price, gap):
-        a = self.asset
-        csv_path = CSV_DIR / f"trades_{a.name.lower()}.csv"
-        header = not csv_path.exists()
-        s = self.state
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        with open(csv_path, "a", newline="") as f:
-            w = csv.writer(f)
-            if header:
-                w.writerow(["ts", "window", "slug", "side", "mode",
-                            "open", "close", "gap", "delta_pct",
-                            "conf", "score", "quality", "confirm_ticks",
-                            "price", "shares", "cost", "result", "pnl", "cum_pnl"])
-            w.writerow([now, s.window_ts, _slug_short(s.slug), s.fire_side,
-                        self.mode_name, f"{s.open_price:.4f}",
-                        f"{close_price:.4f}", f"{gap:+.4f}",
-                        f"{s.best_signal.delta_pct:+.4f}",
-                        f"{s.fire_confidence:.2f}", f"{s.best_signal.score:+.1f}",
-                        f"{self._signal_quality(s.best_signal):.2f}", s.confirm_ticks,
-                        f"{s.fire_price:.2f}", f"{s.fire_shares:.0f}",
-                        f"{s.fire_shares * s.fire_price:.2f}",
-                        result, f"{pnl:.2f}", f"{self.stats.pnl:.2f}"])
+        self.stats.pnl += pnl
+        self._log_trade(
+            resolved_side=resolved_side,
+            close_price=close_price,
+            exit_price=exit_price,
+            result=result,
+            resolved_by=resolved_by,
+            pnl=pnl,
+        )
+        send_telegram(
+            f"📌 {self.asset.name} {result} | side={self.state.fire_side} | resolved={resolved_side} | pnl=${pnl:+.2f}"
+        )
 
-    # ── Main loop ─────────────────────────────────────────────────────────
+    def step(self, now: float | None = None) -> None:
+        now_ts = time.time() if now is None else now
+        price = self.client.fetch_price(self.asset.binance_symbol)
+        if price <= 0:
+            return
+        current_window = self._window_ts(now_ts)
 
-    def run(self):
-        a = self.asset
-        mode_label = "LIVE" if not self.dry_run else "DRY"
-        bal = self.client.get_balance()
-        bal_s = f"${bal:.2f}" if bal else "n/a"
+        if self.state.window_ts == 0:
+            self._reset_window(current_window, price)
 
-        print(f"\n{'─' * 60}")
-        print(f"  🎯 {a.name} Sniper — {mode_label} {self.mode_name}")
-        print(f"  Δ ≥ {a.min_delta_pct:.3f}% | Conf ≥ {a.min_confidence:.0%}"
-              f" | Token [{a.min_token_price:.2f}, {a.max_token_price:.2f}]")
-        print(f"  Eval T-{a.eval_start_secs}→T-{a.eval_end_secs}"
-              f" | Binance: {a.binance_symbol} | Bal: {bal_s}")
-        print(f"  Fire: score ≥ {MIN_SCORE_TO_FIRE:.1f} | strong ≥ {STRONG_SCORE_TO_FIRE:.1f}"
-              f" | confirm ≥ {MIN_CONFIRM_TICKS} ticks")
-        print(f"{'─' * 60}")
+        if current_window != self.state.window_ts:
+            self._finalize_previous_window(price)
+            self._reset_window(current_window, price)
 
+        self.engine.add_tick(price, now_ts)
+        sig = self.engine.analyze(self.state.open_price, price)
+        if sig.score > self.state.best_signal.score:
+            self.state.best_signal = sig
+        secs_left = self._secs_left(now_ts)
+
+        if self._ensure_market() and self._should_fire(sig, secs_left):
+            self._fire_trade(sig)
+        self.state.prev_score = sig.score
+
+        if self.state.fired and secs_left > max(self.asset.eval_end_secs - 2, 2):
+            self._maybe_early_exit()
+
+    def run(self) -> None:
         self.running = True
-        last_ts = 0
-        last_tick = 0.0
-
         while self.running:
-            now = time.time()
-            cur_ts = self._window_ts()
-            sl = self._secs_left()
-            s = self.state
-
-            if cur_ts != last_ts:
-                if last_ts > 0:
-                    self._on_window_end()
-                last_ts = cur_ts
-                self._on_window_start()
-
-            if not s.open_captured and sl > WINDOW_SECS - 10:
-                p = self.client.fetch_price(a.binance_symbol)
-                if p > 0:
-                    s.open_price = p
-                    s.open_captured = True
-
-            in_eval = a.eval_end_secs <= sl <= a.eval_start_secs
-
-            if s.fired and s.fire_side and not s.early_sold and sl > 5:
-                if now - last_tick >= 2.0:
-                    last_tick = now
-                    token = s.up_token if s.fire_side == "UP" else s.down_token
-                    sell_price = self.client.get_sell_price(token)
-                    if sell_price > 0.01:
-                        gain = sell_price - s.fire_price
-                        print(f"  [{a.name}] 📊 {s.fire_side} bid"
-                              f" ${sell_price:.2f} (gain={gain:+.2f})"
-                              f" T-{sl:.0f}s", end="\r")
-                        if gain >= EARLY_EXIT_GAIN:
-                            profit = round(s.fire_shares * gain * 0.98, 2)
-                            print(f"\n  [{a.name}] 💰 EARLY EXIT: sell"
-                                  f" @ {sell_price:.2f} (bought {s.fire_price:.2f})"
-                                  f" +${profit:.2f}")
-                            if not self.dry_run:
-                                self.client.submit_sell(
-                                    token, sell_price, s.fire_shares,
-                                    f"{a.name}-{s.fire_side}-EARLY")
-                            s.early_sold = True
-                            self.stats.wins += 1
-                            self.stats.pnl += profit
-                            if not self.dry_run:
-                                send_telegram(
-                                    f"💰 {a.name} EARLY EXIT:"
-                                    f" {s.fire_side} +${profit:.2f}")
-
-            if in_eval and not s.fired and s.open_captured and s.up_token:
-                if now - last_tick >= 2.0:
-                    p = self.client.fetch_price(a.binance_symbol)
-                    last_tick = now
-                    if p > 0:
-                        self.engine.add_tick(p, now)
-                        sig = self.engine.analyze(s.open_price, p)
-                        self._update_confirmation(sig)
-
-                        # Keep the strongest signal that also passes the basic gating.
-                        if self._signal_alignment_ok(sig):
-                            if abs(sig.score) > abs(s.best_signal.score):
-                                s.best_signal = sig
-
-                        d = "▲" if sig.direction == "UP" else "▼" if sig.direction == "DOWN" else "━"
-                        print(f"  [{a.name}] {d} ${p:,.4f}"
-                              f" Δ={sig.delta_pct:+.3f}%"
-                              f" S={sig.score:+.1f}"
-                              f" C={sig.confidence:.0%}"
-                              f" Q={self._signal_quality(sig):.2f}"
-                              f" K={s.confirm_ticks}"
-                              f" T-{sl:.0f}s", end="\r")
-
-                        s.prev_score = sig.score
-                        if self._should_fire(sig, sl):
-                            print(f"\n  [{a.name}] [TRIGGER] S={sig.score:+.1f}"
-                                  f" C={sig.confidence:.0%} Δ={sig.delta_pct:+.3f}%"
-                                  f" Q={self._signal_quality(sig):.2f} K={s.confirm_ticks}")
-                            self._fire(sig)
-                        elif (
-                            sl <= a.eval_end_secs + 6
-                            and s.confirm_ticks >= MIN_CONFIRM_TICKS
-                            and self._signal_quality(s.best_signal) >= 0.55
-                            and abs(s.best_signal.score) >= 4.5
-                        ):
-                            print(f"\n  [{a.name}] [TRIGGER-BEST]"
-                                  f" S={s.best_signal.score:+.1f}"
-                                  f" C={s.best_signal.confidence:.0%}"
-                                  f" Δ={s.best_signal.delta_pct:+.3f}%"
-                                  f" Q={self._signal_quality(s.best_signal):.2f}")
-                            self._fire(s.best_signal)
-
-            elif not in_eval and not s.fired and sl > a.eval_start_secs:
-                if now - last_tick >= 2.0:
-                    p = self.client.fetch_price(a.binance_symbol)
-                    last_tick = now
-                    if p > 0 and s.open_captured:
-                        g = p - s.open_price
-                        d = "▲" if g > 0 else "▼" if g < 0 else "━"
-                        print(f"  [{a.name}] {d} ${p:,.4f}"
-                              f" Gap={g:+,.4f}"
-                              f" Eval in {sl - a.eval_start_secs:.0f}s",
-                              end="\r")
-
-            try:
-                time.sleep(0.5)
-            except KeyboardInterrupt:
-                self.running = False
-                break
-
-        self._on_window_end()
+            self.step()
+            time.sleep(2.0)
 
     def summary(self) -> str:
-        s = self.stats
-        wr = s.wins / (s.wins + s.losses) * 100 if (s.wins + s.losses) > 0 else 0
-        return (f"{self.asset.name}: {s.fired} trades"
-                f" W/L={s.wins}/{s.losses} ({wr:.0f}%)"
-                f" PnL=${s.pnl:+.2f}")
+        return (
+            f"{self.asset.name}: windows={self.stats.windows} fired={self.stats.fired} "
+            f"wins={self.stats.wins} losses={self.stats.losses} flats={self.stats.flats} "
+            f"pnl=${self.stats.pnl:+.2f}"
+        )

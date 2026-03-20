@@ -1,33 +1,28 @@
-"""
-Per-asset configuration for Polymarket 5-minute Up/Down markets.
-
-Each asset has tuned thresholds based on:
-  - Observed 5-min volatility
-  - Polymarket liquidity depth
-  - Real trading results (176-trade study: ETH/XRP = net losers)
-  - Binance symbol for price feed
-"""
+"""Per-asset configuration for short-horizon Polymarket markets."""
+from __future__ import annotations
 
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class AssetConfig:
-    name: str                # Display name
-    slug_prefix: str         # Polymarket slug prefix: {prefix}-updown-5m-{ts}
-    binance_symbol: str      # Binance ticker symbol
-    chainlink_symbol: str    # Chainlink RTDS symbol (for future WS use)
-    min_delta_pct: float     # Minimum BTC % move to consider trading
-    min_confidence: float    # Minimum composite confidence to fire
-    max_token_price: float   # Don't buy above this (ROI too low)
-    min_token_price: float   # Don't buy if market is undecided
-    eval_start_secs: int     # Start eval at T-X seconds
-    eval_end_secs: int       # Stop eval at T-X seconds
-    priority: int            # 1=best, 5=worst (for multi-asset scheduling)
+    name: str
+    slug_prefix: str
+    binance_symbol: str
+    chainlink_symbol: str
+    min_delta_pct: float
+    min_confidence: float
+    max_token_price: float
+    min_token_price: float
+    eval_start_secs: int
+    eval_end_secs: int
+    priority: int
+    confirm_ticks: int = 3
+    early_exit_profit: float = 0.08
+    max_spread: float = 0.06
+    min_score_gap: float = 0.40
     enabled: bool = True
 
-
-# ── Asset Profiles ────────────────────────────────────────────────────────────
 
 BTC = AssetConfig(
     name="BTC",
@@ -35,12 +30,16 @@ BTC = AssetConfig(
     binance_symbol="BTCUSDT",
     chainlink_symbol="btc/usd",
     min_delta_pct=0.02,
-    min_confidence=0.30,
-    max_token_price=0.88,       # was 0.82 — ask часто 0.83-0.90, ордер не заполнялся
-    min_token_price=0.52,       # ROI при 0.88: 12% net. Breakeven WR=88%. Наш WR~90%.
+    min_confidence=0.35,
+    max_token_price=0.84,
+    min_token_price=0.52,
     eval_start_secs=60,
     eval_end_secs=20,
     priority=1,
+    confirm_ticks=3,
+    early_exit_profit=0.08,
+    max_spread=0.05,
+    min_score_gap=0.50,
 )
 
 SOL = AssetConfig(
@@ -49,12 +48,16 @@ SOL = AssetConfig(
     binance_symbol="SOLUSDT",
     chainlink_symbol="sol/usd",
     min_delta_pct=0.03,
-    min_confidence=0.35,
+    min_confidence=0.40,
     max_token_price=0.80,
     min_token_price=0.52,
-    eval_start_secs=170,
+    eval_start_secs=150,
     eval_end_secs=30,
     priority=2,
+    confirm_ticks=3,
+    early_exit_profit=0.08,
+    max_spread=0.05,
+    min_score_gap=0.55,
 )
 
 ETH = AssetConfig(
@@ -69,6 +72,10 @@ ETH = AssetConfig(
     eval_start_secs=160,
     eval_end_secs=30,
     priority=3,
+    confirm_ticks=4,
+    early_exit_profit=0.08,
+    max_spread=0.05,
+    min_score_gap=0.60,
 )
 
 XRP = AssetConfig(
@@ -78,11 +85,15 @@ XRP = AssetConfig(
     chainlink_symbol="xrp/usd",
     min_delta_pct=0.05,
     min_confidence=0.50,
-    max_token_price=0.78,
+    max_token_price=0.76,
     min_token_price=0.53,
     eval_start_secs=160,
     eval_end_secs=30,
     priority=4,
+    confirm_ticks=4,
+    early_exit_profit=0.08,
+    max_spread=0.05,
+    min_score_gap=0.60,
 )
 
 DOGE = AssetConfig(
@@ -92,14 +103,16 @@ DOGE = AssetConfig(
     chainlink_symbol="doge/usd",
     min_delta_pct=0.08,
     min_confidence=0.55,
-    max_token_price=0.76,
+    max_token_price=0.74,
     min_token_price=0.54,
     eval_start_secs=150,
     eval_end_secs=30,
     priority=5,
+    confirm_ticks=4,
+    early_exit_profit=0.08,
+    max_spread=0.05,
+    min_score_gap=0.65,
 )
-
-# ── Registry ──────────────────────────────────────────────────────────────────
 
 ALL_ASSETS: dict[str, AssetConfig] = {
     "btc": BTC,
@@ -113,12 +126,10 @@ ALL_ASSETS: dict[str, AssetConfig] = {
 def get_asset(name: str) -> AssetConfig:
     key = name.lower().strip()
     if key not in ALL_ASSETS:
-        raise ValueError(f"Unknown asset: {name}. Available: {list(ALL_ASSETS.keys())}")
+        raise ValueError(f"Unknown asset: {name}. Available: {', '.join(ALL_ASSETS)}")
     return ALL_ASSETS[key]
 
 
+
 def get_enabled_assets() -> list[AssetConfig]:
-    return sorted(
-        [a for a in ALL_ASSETS.values() if a.enabled],
-        key=lambda a: a.priority,
-    )
+    return sorted((a for a in ALL_ASSETS.values() if a.enabled), key=lambda a: a.priority)
