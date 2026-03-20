@@ -148,14 +148,18 @@ class PolymarketClient:
         return {"best_bid": 0.0, "best_ask": 0.0}
 
     def get_buy_price(self, token_id: str, max_price: float, min_price: float) -> float:
-        mid = self.fetch_midpoint(token_id)
+        """Get the price we'd actually pay. For FOK = best ask. Fallback to midpoint."""
         book = self.fetch_book(token_id)
-        if mid > 0.01:
-            price = mid + MAKER_SPREAD
-        elif book["best_ask"] > 0:
-            price = book["best_ask"] - 0.01
+        mid = self.fetch_midpoint(token_id)
+
+        # Best ask = actual fill price for FOK
+        if book["best_ask"] > 0:
+            price = book["best_ask"]
+        elif mid > 0.01:
+            price = mid + 0.02
         else:
             return 0.0
+
         price = round(min(price, max_price), 2)
         return price if price >= min_price else 0.0
 
@@ -192,8 +196,48 @@ class PolymarketClient:
 
     # ── Order Submission ──────────────────────────────────────────────────
 
+    def submit_fok_buy(self, token_id: str, amount_usd: float, max_price: float,
+                       label: str) -> str | None:
+        """
+        FOK (Fill or Kill) market buy.
+        Fills instantly at best available price, or cancels entirely.
+        amount_usd = dollars to spend (not shares).
+        max_price = slippage protection (worst price we accept).
+
+        Based on py-clob-client official example:
+          MarketOrderArgs(token_id=..., amount=25.0, side=BUY)
+          client.create_market_order(mo) → client.post_order(signed, OrderType.FOK)
+        """
+        for attempt in range(1, MAX_ORDER_RETRIES + 1):
+            try:
+                from py_clob_client.clob_types import MarketOrderArgs
+                mo = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=round(amount_usd, 2),
+                    price=round(max_price, 2),
+                    side=BUY,
+                )
+                signed = self.clob.create_market_order(mo)
+                resp = self.clob.post_order(signed, OrderType.FOK)
+                oid = resp.get("orderID") if isinstance(resp, dict) else None
+                status = resp.get("status", "") if isinstance(resp, dict) else ""
+                print(f"  [ORDER] FOK BUY {label} ${amount_usd:.2f}"
+                      f" (max {max_price:.2f}) | ID: {oid or '?'}"
+                      f" status: {status}")
+                return oid
+            except Exception as e:
+                err = str(e).lower()
+                print(f"  [!] FOK attempt {attempt}: {e}")
+                if any(kw in err for kw in ("not enough", "balance", "insufficient")):
+                    send_telegram(f"⚠️ Low balance for {label}!")
+                    return None
+                if attempt < MAX_ORDER_RETRIES:
+                    time.sleep(RETRY_DELAY)
+        return None
+
     def submit_maker_buy(self, token_id: str, price: float, size: float,
                          label: str) -> str | None:
+        """GTC limit order (maker, 0% fee). May not fill."""
         for attempt in range(1, MAX_ORDER_RETRIES + 1):
             try:
                 args = OrderArgs(token_id=token_id, price=round(price, 2),
@@ -201,12 +245,12 @@ class PolymarketClient:
                 signed = self.clob.create_order(args)
                 resp = self.clob.post_order(signed, OrderType.GTC)
                 oid = resp.get("orderID") if isinstance(resp, dict) else None
-                print(f"  [ORDER] MAKER BUY {label} @ {price:.2f} x {size:.0f}sh"
+                print(f"  [ORDER] GTC BUY {label} @ {price:.2f} x {size:.0f}sh"
                       f" | ID: {oid or '?'}")
                 return oid
             except Exception as e:
                 err = str(e).lower()
-                print(f"  [!] Order attempt {attempt}: {e}")
+                print(f"  [!] GTC attempt {attempt}: {e}")
                 if any(kw in err for kw in ("not enough", "balance", "insufficient")):
                     send_telegram(f"⚠️ Low balance for {label}!")
                     return None

@@ -264,10 +264,12 @@ class Sniper:
 
         if self.dry_run:
             s.order_id = f"DRY-{a.name}-{sig.direction}-{s.window_ts}"
-            print(f"  [{a.name}] [DRY] Would MAKER BUY {sig.direction}")
+            print(f"  [{a.name}] [DRY] Would FOK BUY {sig.direction} ${cost:.2f}")
         else:
-            s.order_id = self.client.submit_maker_buy(
-                token, buy_price, shares, f"{a.name}-{sig.direction}")
+            # FOK: fill instantly or cancel. amount = dollars to spend.
+            # max_price = slippage protection (buy_price already capped by max_token_price)
+            s.order_id = self.client.submit_fok_buy(
+                token, cost, buy_price, f"{a.name}-{sig.direction}")
 
         self.stats.fired += 1
         if not self.dry_run:
