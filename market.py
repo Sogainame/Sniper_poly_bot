@@ -150,38 +150,34 @@ class PolymarketClient:
             pass
         return {"price": 0.0, "side": ""}
 
-    def fetch_book(self, token_id: str) -> Book:
+    def fetch_best_price(self, token_id: str, side: str) -> float:
         try:
-            if self.clob is not None:
-                try:
-                    raw = self._call_any(self.clob, "get_order_book", "getOrderBook", tokenID=token_id)
-                    bids = raw.get("bids", []) if isinstance(raw, dict) else getattr(raw, "bids", [])
-                    asks = raw.get("asks", []) if isinstance(raw, dict) else getattr(raw, "asks", [])
-                    best_bid = self._to_float((bids[0] or {}).get("price") if bids else 0)
-                    best_ask = self._to_float((asks[0] or {}).get("price") if asks else 0)
-                    tick_size = str(raw.get("tick_size", "0.01") if isinstance(raw, dict) else getattr(raw, "tick_size", "0.01"))
-                    neg_risk = bool(raw.get("neg_risk", False) if isinstance(raw, dict) else getattr(raw, "neg_risk", False))
-                    return Book(best_bid=best_bid, best_ask=best_ask, spread=max(best_ask - best_bid, 0.0), tick_size=tick_size, neg_risk=neg_risk)
-                except Exception:
-                    pass
-
-            resp = self.http.get(f"{CLOB_HOST}/book", params={"token_id": token_id}, timeout=5.0)
+            resp = self.http.get(
+                f"{CLOB_HOST}/price",
+                params={"token_id": token_id, "side": side},
+                timeout=5.0,
+            )
             if resp.status_code == 200:
                 data = resp.json()
-                bids = data.get("bids", [])
-                asks = data.get("asks", [])
-                best_bid = self._to_float((bids[0] or {}).get("price") if bids else 0)
-                best_ask = self._to_float((asks[0] or {}).get("price") if asks else 0)
-                return Book(
-                    best_bid=best_bid,
-                    best_ask=best_ask,
-                    spread=max(best_ask - best_bid, 0.0),
-                    tick_size=str(data.get("tick_size", "0.01")),
-                    neg_risk=bool(data.get("neg_risk", False)),
-                )
+                return self._to_float(data.get("price", 0))
         except Exception:
             pass
-        return Book()
+        return 0.0
+
+    def fetch_book(self, token_id: str) -> Book:
+        bid = self.fetch_best_price(token_id, "SELL")  # what you receive when selling
+        ask = self.fetch_best_price(token_id, "BUY")   # what you pay when buying
+
+        if bid <= 0 or ask <= 0:
+            return Book()
+
+        return Book(
+            best_bid=bid,
+            best_ask=ask,
+            spread=max(ask - bid, 0.0),
+            tick_size="0.01",
+            neg_risk=False,
+        )
 
     def get_buy_price(self, token_id: str, max_price: float, min_price: float) -> float:
         book = self.fetch_book(token_id)
