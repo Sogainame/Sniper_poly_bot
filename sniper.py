@@ -174,10 +174,15 @@ class Sniper:
     def _fire_trade(self, sig: Signal) -> bool:
         token_id = self._entry_token(sig.direction)
         if not token_id:
+            print(f"❌ skip: market_not_found")
             return False
 
         book = self.client.fetch_book(token_id)
         if book.spread > self.asset.max_spread:
+            print(f"❌ skip: spread={book.spread:.3f} > max={self.asset.max_spread}")
+            return False
+        if book.best_bid <= 0 or book.best_ask <= 0:
+            print(f"❌ skip: no_bid_or_ask bid={book.best_bid:.3f} ask={book.best_ask:.3f}")
             return False
 
         price = self.client.get_buy_price(
@@ -186,15 +191,19 @@ class Sniper:
             min_price=self.asset.min_token_price,
         )
         if price <= 0:
+            print(f"❌ skip: token_price={price:.3f} (min={self.asset.min_token_price}, max={self.asset.max_token_price})")
             return False
 
         stake = self._stake_usd(sig.confidence, price)
         if stake <= 0:
+            print(f"❌ skip: stake=0 (bal={self._balance():.2f}, conf={sig.confidence:.2f}, price={price:.3f})")
             return False
         shares = round(stake / price, 4)
         if shares <= 0:
+            print(f"❌ skip: shares=0")
             return False
 
+        print(f"✅ BUY_ATTEMPT {self.asset.name} {sig.direction} | price={price:.3f} | stake=${stake:.2f} | shares={shares:.4f}")
         order_id = "dry-run"
         if not self.dry_run:
             order_id = self.client.submit_maker_buy(token_id, price, shares, f"{self.asset.name} {sig.direction}")
@@ -385,6 +394,11 @@ class Sniper:
             )
 
         if self._ensure_market() and self._should_fire(sig, secs_left):
+            print(
+                f"🔥 FIRE_CHECK {self.asset.name} | dir={sig.direction} | "
+                f"secs_left={secs_left:.0f} | conf={sig.confidence:.2f} | "
+                f"delta={sig.delta_pct:.4f}%"
+            )
             self._fire_trade(sig)
         self.state.prev_score = sig.score
 
