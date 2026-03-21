@@ -26,14 +26,18 @@ RETRY_DELAY = 0.5
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams
+    from py_clob_client.clob_types import (
+        ApiCreds, AssetType, BalanceAllowanceParams, OrderType,
+        MarketOrderArgs, PartialCreateOrderOptions,
+    )
     from py_clob_client.order_builder.constants import BUY, SELL
-    from py_clob_client.clob_types import OrderType
 except Exception:  # pragma: no cover - optional dependency in this environment
     ClobClient = None  # type: ignore[assignment]
     ApiCreds = None  # type: ignore[assignment]
     AssetType = None  # type: ignore[assignment]
     BalanceAllowanceParams = None  # type: ignore[assignment]
+    MarketOrderArgs = None  # type: ignore[assignment]
+    PartialCreateOrderOptions = None  # type: ignore[assignment]
     BUY = "BUY"
     SELL = "SELL"
 
@@ -274,39 +278,33 @@ class PolymarketClient:
         if self.clob is None:
             print(f"[!] Live order blocked for {label}: py-clob-client/client not available")
             return None
-        options = self._market_order_options(token_id)
+
         for attempt in range(1, MAX_ORDER_RETRIES + 1):
             try:
-                if hasattr(self.clob, "create_and_post_market_order"):
-                    resp = self.clob.create_and_post_market_order(
-                        {
-                            "tokenID": token_id,
-                            "side": side,
-                            "amount": amount,
-                            "price": price,
-                        },
-                        {"tickSize": options["tick_size"], "negRisk": options["neg_risk"]},
-                        OrderType.FOK,
+                order_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=round(amount, 2),
+                    price=round(price, 2),
+                    side=side,
+                )
+                options = None
+                if PartialCreateOrderOptions is not None:
+                    options = PartialCreateOrderOptions(
+                        tick_size="0.01",
+                        neg_risk=False,
                     )
-                else:
-                    create_fn = getattr(self.clob, "create_market_order", None)
-                    post_fn = getattr(self.clob, "post_order", None)
-                    if create_fn is None or post_fn is None:
-                        raise RuntimeError("Missing market-order methods in py-clob-client")
-                    signed = create_fn(
-                        {
-                            "tokenID": token_id,
-                            "side": side,
-                            "amount": amount,
-                            "price": price,
-                        },
-                        {"tickSize": options["tick_size"], "negRisk": options["neg_risk"]},
-                    )
-                    resp = post_fn(signed, OrderType.FOK)
+
+                signed = self.clob.create_market_order(order_args, options)
+                resp = self.clob.post_order(signed, OrderType.FOK)
 
                 if isinstance(resp, dict):
-                    return resp.get("orderID") or resp.get("id")
-                return getattr(resp, "orderID", None) or getattr(resp, "id", None)
+                    oid = resp.get("orderID") or resp.get("id")
+                else:
+                    oid = getattr(resp, "orderID", None) or getattr(resp, "id", None)
+
+                if oid:
+                    print(f"[✓] {label} order={oid}")
+                return oid
             except Exception as exc:
                 err = str(exc)
                 print(f"[!] {label} attempt {attempt}: {err}")
