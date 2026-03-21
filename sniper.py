@@ -232,7 +232,7 @@ class Sniper:
         self.stats.fired += 1
 
         msg = (
-            f"🎯 {self.asset.name} {sig.direction} | entry={price:.3f} | shares={shares:.4f} | "
+            f"🎯 {self.asset.name} {sig.direction} | entry={entry_price:.3f} | shares={shares:.4f} | "
             f"stake=${stake:.2f} | conf={sig.confidence:.2f} | delta={sig.delta_pct:.4f}%"
         )
         print(msg)
