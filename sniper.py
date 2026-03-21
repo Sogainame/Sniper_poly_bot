@@ -37,6 +37,7 @@ class WindowState:
     best_signal: Signal = field(default_factory=Signal)
     prev_score: float = 0.0
     fired: bool = False
+    fire_ts: float = 0.0
     fire_side: str = ""
     fire_token: str = ""
     fire_price: float = 0.0
@@ -47,6 +48,7 @@ class WindowState:
     early_sold: bool = False
     early_sell_price: float = 0.0
     early_sell_order_id: str | None = None
+    sell_attempts: int = 0
 
 
 @dataclass
@@ -232,6 +234,7 @@ class Sniper:
                 return False
 
         self.state.fired = True
+        self.state.fire_ts = time.time()
         self.state.fire_side = sig.direction
         self.state.fire_token = token_id
         self.state.fire_price = entry_price
@@ -252,6 +255,13 @@ class Sniper:
     def _maybe_early_exit(self) -> None:
         if not self.state.fired or self.state.early_sold:
             return
+        # Wait for settlement (Polygon block time ~2s, give 10s buffer)
+        if time.time() - self.state.fire_ts < 10:
+            return
+        # Stop spamming after 3 failed sell attempts
+        if self.state.sell_attempts >= 3:
+            return
+
         book = self.client.fetch_book(self.state.fire_token)
         exit_price = round(book.best_bid, 3)
         if exit_price <= 0:
@@ -261,6 +271,7 @@ class Sniper:
 
         order_id = "dry-run"
         if not self.dry_run:
+            self.state.sell_attempts += 1
             order_id = self.client.submit_sell(
                 self.state.fire_token,
                 exit_price,
