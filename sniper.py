@@ -120,6 +120,7 @@ class Sniper:
     def _reset_window(self, window_ts: int, open_price: float) -> None:
         self.engine.reset()
         self.state = WindowState(window_ts=window_ts, open_price=open_price)
+        self._last_reason = ""
         self.stats.windows += 1
 
     def _ensure_market(self) -> bool:
@@ -155,6 +156,9 @@ class Sniper:
             return False
         if abs(sig.delta_pct) < self.asset.min_delta_pct:
             self._last_reason = f"delta<{self.asset.min_delta_pct}"
+            return False
+        if (sig.delta_pct > 0 and sig.direction != "UP") or (sig.delta_pct < 0 and sig.direction != "DOWN"):
+            self._last_reason = f"dir_mismatch:{sig.direction}/delta={sig.delta_pct:+.4f}"
             return False
         if sig.confidence < self.asset.min_confidence:
             self._last_reason = f"conf<{self.asset.min_confidence}"
