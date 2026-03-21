@@ -149,13 +149,11 @@ class Sniper:
             return False
         if not sig.direction:
             return False
+        if secs_left > self.asset.eval_start_secs or secs_left < self.asset.eval_end_secs:
+            return False
         if abs(sig.delta_pct) < self.asset.min_delta_pct:
             return False
         if sig.confidence < self.asset.min_confidence:
-            return False
-        if sig.score <= self.state.prev_score + self.asset.min_score_gap:
-            return False
-        if secs_left > self.asset.eval_start_secs or secs_left < self.asset.eval_end_secs:
             return False
         if not self._confirm_direction(sig.direction):
             return False
