@@ -10,6 +10,7 @@ from pathlib import Path
 from assets import AssetConfig
 from market import PolymarketClient
 from notifier import send_telegram
+from price_feed import BinanceWsPriceFeed
 from signal_engine import Signal, SignalEngine
 
 WINDOW_SECS = 300
@@ -66,12 +67,14 @@ class Sniper:
         self,
         asset: AssetConfig,
         client: PolymarketClient,
+        price_feed: BinanceWsPriceFeed,
         dry_run: bool = True,
         mode: str = "safe",
         max_bet: float = 50.0,
     ) -> None:
         self.asset = asset
         self.client = client
+        self.price_feed = price_feed
         self.dry_run = dry_run
         self.mode_name = mode
         self.mode_cfg = MODES[mode]
@@ -385,7 +388,13 @@ class Sniper:
 
     def step(self, now: float | None = None) -> None:
         now_ts = time.time() if now is None else now
-        price = self.client.fetch_price(self.asset.binance_symbol)
+
+        # Read price from WebSocket (RAM read, ~0ms) instead of REST (~2000ms)
+        if self.price_feed.is_stale(3000):
+            self._last_reason = "stale_price"
+            return
+        snap = self.price_feed.latest()
+        price = snap.price
         if price <= 0:
             return
         current_window = self._window_ts(now_ts)
