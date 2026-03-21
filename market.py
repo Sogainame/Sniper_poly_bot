@@ -165,8 +165,8 @@ class PolymarketClient:
         return 0.0
 
     def fetch_book(self, token_id: str) -> Book:
-        bid = self.fetch_best_price(token_id, "SELL")  # what you receive when selling
-        ask = self.fetch_best_price(token_id, "BUY")   # what you pay when buying
+        bid = self.fetch_best_price(token_id, "BUY")   # best bid = highest buy offer
+        ask = self.fetch_best_price(token_id, "SELL")   # best ask = lowest sell offer
 
         if bid <= 0 or ask <= 0:
             return Book()
