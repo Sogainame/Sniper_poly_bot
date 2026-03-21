@@ -1,0 +1,16 @@
+{
+  "name": "polymarket-auto-redeem",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Auto-redeem winning Polymarket positions via Safe/Proxy relayer",
+  "main": "auto-redeem.mjs",
+  "scripts": {
+    "start": "node auto-redeem.mjs",
+    "once": "node auto-redeem.mjs --once"
+  },
+  "dependencies": {
+    "@polymarket/builder-relayer-client": "^0.0.8",
+    "dotenv": "^16.4.0",
+    "ethers": "^6.13.0"
+  }
+}
