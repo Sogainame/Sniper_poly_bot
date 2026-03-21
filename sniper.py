@@ -80,6 +80,8 @@ class Sniper:
         self.state = WindowState()
         self.stats = Stats()
         self.running = False
+        self._last_heartbeat_ts = 0.0
+        self._last_reason = ""
         CSV_DIR.mkdir(parents=True, exist_ok=True)
 
     def _window_ts(self, now: float | None = None) -> int:
@@ -146,17 +148,24 @@ class Sniper:
 
     def _should_fire(self, sig: Signal, secs_left: float) -> bool:
         if self.state.fired:
+            self._last_reason = "already_fired"
             return False
         if not sig.direction:
-            return False
-        if secs_left > self.asset.eval_start_secs or secs_left < self.asset.eval_end_secs:
+            self._last_reason = "no_direction"
             return False
         if abs(sig.delta_pct) < self.asset.min_delta_pct:
+            self._last_reason = f"delta<{self.asset.min_delta_pct}"
             return False
         if sig.confidence < self.asset.min_confidence:
+            self._last_reason = f"conf<{self.asset.min_confidence}"
+            return False
+        if secs_left > self.asset.eval_start_secs or secs_left < self.asset.eval_end_secs:
+            self._last_reason = f"outside_window:{secs_left:.0f}s"
             return False
         if not self._confirm_direction(sig.direction):
+            self._last_reason = f"confirm<{self.asset.confirm_ticks}"
             return False
+        self._last_reason = "READY"
         return True
 
     def _entry_token(self, direction: str) -> str:
@@ -366,6 +375,14 @@ class Sniper:
         if sig.score > self.state.best_signal.score:
             self.state.best_signal = sig
         secs_left = self._secs_left(now_ts)
+
+        if now_ts - self._last_heartbeat_ts >= 10:
+            self._last_heartbeat_ts = now_ts
+            print(
+                f"👀 {self.asset.name} | px={price:.2f} | open={self.state.open_price:.2f} | "
+                f"secs_left={secs_left:.0f} | score={sig.score:.2f} | conf={sig.confidence:.2f} | "
+                f"delta={sig.delta_pct:.4f}% | reason={self._last_reason}"
+            )
 
         if self._ensure_market() and self._should_fire(sig, secs_left):
             self._fire_trade(sig)
