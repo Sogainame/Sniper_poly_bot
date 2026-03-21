@@ -7,7 +7,7 @@
 1. Каждые 5 минут Polymarket открывает рынок: "BTC вырастет или упадёт?"
 2. Бот ждёт до последней минуты (T-60 → T-20 секунд до конца)
 3. Анализирует направление BTC по delta + momentum + tick consistency
-4. Покупает UP или DOWN токен по $0.50-0.86
+4. Покупает UP или DOWN токен по $0.35-0.86
 5. Если токен вырос на +$0.06 до закрытия — продаёт досрочно
 6. Если выиграл и не продал — Polymarket возвращает $1.00 за токен
 7. Если проиграл — потерял стоимость токена
@@ -28,9 +28,9 @@ python3 bot.py --asset btc
 ## Режимы
 
 ```bash
-python3 bot.py --asset btc --live --mode safe        # risk_scale=0.25
-python3 bot.py --asset btc --live --mode aggressive   # risk_scale=0.50
-python3 bot.py --asset btc --live --mode degen         # risk_scale=1.00
+python3 bot.py --asset btc --live --mode safe        # 25% risk
+python3 bot.py --asset btc --live --mode aggressive   # 50% risk
+python3 bot.py --asset btc --live --mode degen         # 100% risk
 python3 bot.py --asset btc                             # dry-run
 ```
 
@@ -42,10 +42,11 @@ python3 bot.py --asset btc                             # dry-run
 | Min delta | 0.015% |
 | Min confidence | 0.30 |
 | Max token | $0.86 |
-| Min token | $0.50 |
+| Min token | $0.35 |
 | Early exit | +$0.06 |
 | Max spread | $0.06 |
 | Confirm ticks | 2 |
+| Min stake | $1.00 |
 
 ## VPS
 
