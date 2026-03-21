@@ -189,40 +189,42 @@ class Sniper:
             print(f"❌ skip: no_bid_or_ask bid={book.best_bid:.3f} ask={book.best_ask:.3f}")
             return False
 
-        price = self.client.get_buy_price(
-            token_id,
-            max_price=self.asset.max_token_price,
-            min_price=self.asset.min_token_price,
-        )
-        if price <= 0:
-            print(f"❌ skip: token_price={price:.3f} (min={self.asset.min_token_price}, max={self.asset.max_token_price})")
+        entry_price = round(book.best_ask, 3)
+        if entry_price <= 0:
+            print("❌ skip: bad_ask")
+            return False
+        if entry_price > self.asset.max_token_price or entry_price < self.asset.min_token_price:
+            print(f"❌ skip: token_price={entry_price:.3f} (min={self.asset.min_token_price}, max={self.asset.max_token_price})")
             return False
 
         bal = self._balance()
-        stake = self._stake_usd(sig.confidence, price)
+        stake = self._stake_usd(sig.confidence, entry_price)
 
         if stake < 1.0 and bal >= 1.50:
             stake = 1.0
 
         if stake <= 0:
-            print(f"❌ skip: stake=0 (bal={bal:.2f}, conf={sig.confidence:.2f}, price={price:.3f})")
+            print(f"❌ skip: stake=0 (bal={bal:.2f}, conf={sig.confidence:.2f}, price={entry_price:.3f})")
             return False
-        shares = round(stake / price, 4)
+        shares = round(stake / entry_price, 4)
         if shares <= 0:
             print(f"❌ skip: shares=0")
             return False
 
-        print(f"✅ BUY_ATTEMPT {self.asset.name} {sig.direction} | price={price:.3f} | stake=${stake:.2f} | shares={shares:.4f}")
+        print(
+            f"✅ BUY_ATTEMPT {self.asset.name} {sig.direction} | "
+            f"price={entry_price:.3f} | stake=${stake:.2f} | shares={shares:.4f}"
+        )
         order_id = "dry-run"
         if not self.dry_run:
-            order_id = self.client.submit_maker_buy(token_id, price, shares, f"{self.asset.name} {sig.direction}")
+            order_id = self.client.submit_maker_buy(token_id, entry_price, shares, f"{self.asset.name} {sig.direction}")
             if not order_id:
                 return False
 
         self.state.fired = True
         self.state.fire_side = sig.direction
         self.state.fire_token = token_id
-        self.state.fire_price = price
+        self.state.fire_price = entry_price
         self.state.fire_shares = shares
         self.state.fire_confidence = sig.confidence
         self.state.fire_stake_usd = stake
@@ -240,17 +242,18 @@ class Sniper:
     def _maybe_early_exit(self) -> None:
         if not self.state.fired or self.state.early_sold:
             return
-        bid = self.client.get_sell_price(self.state.fire_token)
-        if bid <= 0:
+        book = self.client.fetch_book(self.state.fire_token)
+        exit_price = round(book.best_bid, 3)
+        if exit_price <= 0:
             return
-        if bid - self.state.fire_price < self.asset.early_exit_profit:
+        if exit_price - self.state.fire_price < self.asset.early_exit_profit:
             return
 
         order_id = "dry-run"
         if not self.dry_run:
             order_id = self.client.submit_sell(
                 self.state.fire_token,
-                bid,
+                exit_price,
                 self.state.fire_shares,
                 f"{self.asset.name} {self.state.fire_side}",
             )
@@ -258,9 +261,9 @@ class Sniper:
                 return
 
         self.state.early_sold = True
-        self.state.early_sell_price = bid
+        self.state.early_sell_price = exit_price
         self.state.early_sell_order_id = order_id
-        pnl = (bid - self.state.fire_price) * self.state.fire_shares
+        pnl = (exit_price - self.state.fire_price) * self.state.fire_shares
         self.stats.pnl += pnl
         self.stats.closed += 1
         self.stats.early_exits += 1
