@@ -188,6 +188,9 @@ class Sniper:
         if book.best_bid <= 0 or book.best_ask <= 0:
             print(f"❌ skip: no_bid_or_ask bid={book.best_bid:.3f} ask={book.best_ask:.3f}")
             return False
+        if book.best_ask < book.best_bid:
+            print(f"❌ skip: crossed_book bid={book.best_bid:.3f} ask={book.best_ask:.3f}")
+            return False
 
         entry_price = round(book.best_ask, 3)
         if entry_price <= 0:
@@ -273,7 +276,7 @@ class Sniper:
             self.stats.losses += 1
         else:
             self.stats.flats += 1
-        text = f"💸 {self.asset.name} early-exit @ {bid:.3f} | pnl=${pnl:+.2f}"
+        text = f"💸 {self.asset.name} early-exit @ {exit_price:.3f} | pnl=${pnl:+.2f}"
         print(text)
         send_telegram(text)
 
