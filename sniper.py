@@ -198,9 +198,14 @@ class Sniper:
             print(f"❌ skip: token_price={price:.3f} (min={self.asset.min_token_price}, max={self.asset.max_token_price})")
             return False
 
+        bal = self._balance()
         stake = self._stake_usd(sig.confidence, price)
+
+        if 0 < stake < 1.0 and bal >= 1.0:
+            stake = 1.0
+
         if stake <= 0:
-            print(f"❌ skip: stake=0 (bal={self._balance():.2f}, conf={sig.confidence:.2f}, price={price:.3f})")
+            print(f"❌ skip: stake=0 (bal={bal:.2f}, conf={sig.confidence:.2f}, price={price:.3f})")
             return False
         shares = round(stake / price, 4)
         if shares <= 0:
