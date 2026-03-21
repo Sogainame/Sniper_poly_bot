@@ -178,6 +178,10 @@ class Sniper:
             return False
 
         book = self.client.fetch_book(token_id)
+        print(
+            f"📘 BOOK {self.asset.name} | bid={book.best_bid:.3f} | "
+            f"ask={book.best_ask:.3f} | spread={book.spread:.3f}"
+        )
         if book.spread > self.asset.max_spread:
             print(f"❌ skip: spread={book.spread:.3f} > max={self.asset.max_spread}")
             return False
