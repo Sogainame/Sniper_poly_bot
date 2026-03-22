@@ -118,37 +118,33 @@ function buildRedeemCalldata(conditionId) {
 }
 
 // ── Init relayer client ─────────────────────────────────────────────
+const RELAYER_URL = "https://builder-relayer.polymarket.com";
+
 async function initRelayerClient() {
-  // Dynamic import to handle ESM/CJS differences
   const relayerModule = await import("@polymarket/builder-relayer-client");
 
   const RelayClient = relayerModule.RelayClient || relayerModule.default?.RelayClient;
   if (!RelayClient) {
-    // List available exports for debugging
     log("warn", "Available exports from builder-relayer-client", {
       keys: Object.keys(relayerModule),
     });
     throw new Error("Cannot find RelayClient in @polymarket/builder-relayer-client");
   }
 
-  const clientOpts = {
-    apiKey: BUILDER_API_KEY,
-    apiSecret: BUILDER_SECRET,
-    apiPassphrase: BUILDER_PASSPHRASE,
-    chainId: CHAIN_ID,
-    privateKey: PRIVATE_KEY,
-    funder: PROXY_WALLET,
+  const RelayerTxType = relayerModule.RelayerTxType;
+
+  // Constructor: RelayClient(relayerUrl, chainId, signer, builderConfig, relayTxType)
+  const signer = PRIVATE_KEY;
+  const builderConfig = {
+    localBuilderCreds: {
+      key: BUILDER_API_KEY,
+      secret: BUILDER_SECRET,
+      passphrase: BUILDER_PASSPHRASE,
+    },
   };
+  const txType = WALLET_TYPE === "PROXY" ? RelayerTxType.PROXY : RelayerTxType.SAFE;
 
-  // PROXY type uses different relay tx type
-  if (WALLET_TYPE === "PROXY") {
-    const RelayerTxType = relayerModule.RelayerTxType;
-    if (RelayerTxType) {
-      clientOpts.txType = RelayerTxType.PROXY;
-    }
-  }
-
-  return new RelayClient(clientOpts);
+  return new RelayClient(RELAYER_URL, CHAIN_ID, signer, builderConfig, txType);
 }
 
 // ── Main redeem loop ────────────────────────────────────────────────
@@ -251,10 +247,15 @@ async function redeemOnce() {
 
     try {
       const redeemTx = buildRedeemCalldata(conditionId);
-      const resp = await client.execute([redeemTx], "redeem positions");
-      const result = await resp.wait();
+      let resp;
+      if (WALLET_TYPE === "PROXY") {
+        resp = await client.executeProxyTransactions([redeemTx]);
+      } else {
+        resp = await client.executeSafeTransactions([redeemTx]);
+      }
+      const result = typeof resp?.wait === "function" ? await resp.wait() : resp;
 
-      const txHash = result?.transactionHash || result?.hash || JSON.stringify(result);
+      const txHash = result?.transactionHash || result?.hash || result?.id || JSON.stringify(result);
       log("info", "Redeem SUCCESS", { ...logData, status: "success", txHash });
 
       state.items[conditionId] = {
