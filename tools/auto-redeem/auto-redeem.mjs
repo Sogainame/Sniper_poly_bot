@@ -122,26 +122,25 @@ const RELAYER_URL = "https://builder-relayer.polymarket.com";
 
 async function initRelayerClient() {
   const relayerModule = await import("@polymarket/builder-relayer-client");
+  const signingModule = await import("@polymarket/builder-signing-sdk");
 
   const RelayClient = relayerModule.RelayClient || relayerModule.default?.RelayClient;
   if (!RelayClient) {
-    log("warn", "Available exports from builder-relayer-client", {
-      keys: Object.keys(relayerModule),
-    });
     throw new Error("Cannot find RelayClient in @polymarket/builder-relayer-client");
   }
 
+  const { BuilderConfig } = signingModule;
   const RelayerTxType = relayerModule.RelayerTxType;
 
   // Constructor: RelayClient(relayerUrl, chainId, signer, builderConfig, relayTxType)
   const signer = PRIVATE_KEY;
-  const builderConfig = {
+  const builderConfig = new BuilderConfig({
     localBuilderCreds: {
       key: BUILDER_API_KEY,
       secret: BUILDER_SECRET,
       passphrase: BUILDER_PASSPHRASE,
     },
-  };
+  });
   const txType = WALLET_TYPE === "PROXY" ? RelayerTxType.PROXY : RelayerTxType.SAFE;
 
   return new RelayClient(RELAYER_URL, CHAIN_ID, signer, builderConfig, txType);
