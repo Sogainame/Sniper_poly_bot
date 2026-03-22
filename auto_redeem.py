@@ -41,7 +41,7 @@ def main():
         HOST,
         key=PRIVATE_KEY,
         chain_id=CHAIN_ID,
-        signature_type=1,  # Proxy wallet
+        signature_type=2,  # Safe
         funder=PROXY_WALLET,
     )
     clob.set_api_creds(clob.create_or_derive_api_creds())

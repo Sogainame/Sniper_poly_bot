@@ -1,4 +1,8 @@
-"""Per-asset configuration for short-horizon Polymarket markets."""
+"""Per-asset configuration for short-horizon Polymarket markets.
+
+V3: V2 structure (confirm_ticks, max_spread, early_exit_profit) merged with
+V1 BTC entry parameters (eval 60→20, delta 0.02, min_price 0.52).
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,29 +21,35 @@ class AssetConfig:
     eval_start_secs: int
     eval_end_secs: int
     priority: int
-    confirm_ticks: int = 3
-    early_exit_profit: float = 0.08
-    max_spread: float = 0.06
-    min_score_gap: float = 0.40
+    confirm_ticks: int = 3          # from V2: consecutive ticks in same direction
+    early_exit_profit: float = 0.10  # from V1: gain threshold for early sell
+    max_spread: float = 0.06        # from V2: skip if book spread wider
+    min_score_gap: float = 0.40     # from V2: minimum score jump between ticks
     enabled: bool = True
 
+
+# ── V1 proven params for BTC ─────────────────────────────────────────────────
+# eval 60→20: 4 min of price action filters noise, 20s buffer before close
+# min_delta 0.02: proven profitable at ≥0.08% with DOWN signals
+# min_token_price 0.52: don't buy undecided markets
+# max_token_price 0.88: ROI 12% net, breakeven WR=88%, our WR~90%
 
 BTC = AssetConfig(
     name="BTC",
     slug_prefix="btc",
     binance_symbol="BTCUSDT",
     chainlink_symbol="btc/usd",
-    min_delta_pct=0.015,
+    min_delta_pct=0.02,         # V1 value (V2 was 0.015 — too low)
     min_confidence=0.30,
-    max_token_price=0.90,
-    min_token_price=0.35,
-    eval_start_secs=30,
-    eval_end_secs=5,
+    max_token_price=0.88,       # V1 value (V2 was 0.90)
+    min_token_price=0.52,       # V1 value (V2 was 0.35 — too risky)
+    eval_start_secs=60,         # V1 value (V2 was 40)
+    eval_end_secs=20,           # V1 value (V2 was 5 — too late, MM already repriced)
     priority=1,
-    confirm_ticks=2,
-    early_exit_profit=0.06,
-    max_spread=0.06,
-    min_score_gap=0.20,
+    confirm_ticks=2,            # V2 addition: require 2 ticks confirming direction
+    early_exit_profit=0.10,     # V1 value (V2 was 0.06)
+    max_spread=0.06,            # V2 addition
+    min_score_gap=0.20,         # V2 addition
 )
 
 SOL = AssetConfig(
@@ -48,14 +58,14 @@ SOL = AssetConfig(
     binance_symbol="SOLUSDT",
     chainlink_symbol="sol/usd",
     min_delta_pct=0.03,
-    min_confidence=0.40,
+    min_confidence=0.35,
     max_token_price=0.80,
     min_token_price=0.52,
-    eval_start_secs=150,
+    eval_start_secs=170,
     eval_end_secs=30,
     priority=2,
     confirm_ticks=3,
-    early_exit_profit=0.08,
+    early_exit_profit=0.10,
     max_spread=0.05,
     min_score_gap=0.55,
 )
@@ -73,7 +83,7 @@ ETH = AssetConfig(
     eval_end_secs=30,
     priority=3,
     confirm_ticks=4,
-    early_exit_profit=0.08,
+    early_exit_profit=0.10,
     max_spread=0.05,
     min_score_gap=0.60,
 )
@@ -85,13 +95,13 @@ XRP = AssetConfig(
     chainlink_symbol="xrp/usd",
     min_delta_pct=0.05,
     min_confidence=0.50,
-    max_token_price=0.76,
+    max_token_price=0.78,
     min_token_price=0.53,
     eval_start_secs=160,
     eval_end_secs=30,
     priority=4,
     confirm_ticks=4,
-    early_exit_profit=0.08,
+    early_exit_profit=0.10,
     max_spread=0.05,
     min_score_gap=0.60,
 )
@@ -103,13 +113,13 @@ DOGE = AssetConfig(
     chainlink_symbol="doge/usd",
     min_delta_pct=0.08,
     min_confidence=0.55,
-    max_token_price=0.74,
+    max_token_price=0.76,
     min_token_price=0.54,
     eval_start_secs=150,
     eval_end_secs=30,
     priority=5,
     confirm_ticks=4,
-    early_exit_profit=0.08,
+    early_exit_profit=0.10,
     max_spread=0.05,
     min_score_gap=0.65,
 )
@@ -128,7 +138,6 @@ def get_asset(name: str) -> AssetConfig:
     if key not in ALL_ASSETS:
         raise ValueError(f"Unknown asset: {name}. Available: {', '.join(ALL_ASSETS)}")
     return ALL_ASSETS[key]
-
 
 
 def get_enabled_assets() -> list[AssetConfig]:
