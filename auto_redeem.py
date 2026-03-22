@@ -41,13 +41,14 @@ def main():
         HOST,
         key=PRIVATE_KEY,
         chain_id=CHAIN_ID,
-        signature_type=2,  # Safe
+        signature_type=1,  # Proxy wallet
         funder=PROXY_WALLET,
     )
     clob.set_api_creds(clob.create_or_derive_api_creds())
     print("[+] CLOB client ready")
 
     # 2. Init Relayer client
+    from py_builder_relayer_client.types import RelayerTxType
     relayer = RelayClient(
         RELAYER_URL,
         CHAIN_ID,
@@ -59,6 +60,7 @@ def main():
                 passphrase=BUILDER_PASSPHRASE,
             )
         ),
+        RelayerTxType.PROXY,
     )
     print("[+] Relayer client ready")
 
