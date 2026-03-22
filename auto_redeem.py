@@ -48,7 +48,6 @@ def main():
     print("[+] CLOB client ready")
 
     # 2. Init Relayer client
-    from py_builder_relayer_client.types import RelayerTxType
     relayer = RelayClient(
         RELAYER_URL,
         CHAIN_ID,
@@ -60,7 +59,6 @@ def main():
                 passphrase=BUILDER_PASSPHRASE,
             )
         ),
-        RelayerTxType.PROXY,
     )
     print("[+] Relayer client ready")
 
