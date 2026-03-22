@@ -179,24 +179,37 @@ class PolymarketClient:
             pass
         return 0.0
 
-    def fetch_book(self, token_id: str) -> Book:
-        """Fetch order book — use /book endpoint directly (V1 approach, more reliable)."""
+    def _fetch_best_price(self, token_id: str, side: str) -> float:
+        """Fetch best price via /price endpoint (returns actual best bid/ask)."""
         try:
-            r = self.http.get(f"{CLOB_HOST}/book", params={"token_id": token_id}, timeout=5.0)
-            if r.status_code == 200:
-                book = r.json()
-                bids = book.get("bids", [])
-                asks = book.get("asks", [])
-                best_bid = float(bids[0]["price"]) if bids else 0.0
-                best_ask = float(asks[0]["price"]) if asks else 0.0
-                return Book(
-                    best_bid=best_bid,
-                    best_ask=best_ask,
-                    spread=max(best_ask - best_bid, 0.0) if best_bid > 0 and best_ask > 0 else 0.0,
-                )
+            resp = self.http.get(
+                f"{CLOB_HOST}/price",
+                params={"token_id": token_id, "side": side},
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                return self._to_float(resp.json().get("price", 0))
         except Exception:
             pass
-        return Book()
+        return 0.0
+
+    def fetch_book(self, token_id: str) -> Book:
+        """Fetch best bid/ask via /price endpoint.
+
+        Note: /book endpoint returns bids sorted lowest-first (0.01, 0.02, ...),
+        NOT best-first. The /price endpoint returns the actual best price directly.
+        """
+        bid = self._fetch_best_price(token_id, "SELL")   # best bid = highest buy offer
+        ask = self._fetch_best_price(token_id, "BUY")    # best ask = lowest sell offer
+
+        if bid <= 0 or ask <= 0:
+            return Book()
+
+        return Book(
+            best_bid=bid,
+            best_ask=ask,
+            spread=max(ask - bid, 0.0),
+        )
 
     def get_buy_price(self, token_id: str, max_price: float, min_price: float) -> float:
         """Buy price = best_ask (V1: guaranteed fill, taker fee ~1.5%)."""
