@@ -20,7 +20,7 @@ BALANCE_RESERVE = 0.50
 CSV_DIR = Path("data/sniper")
 
 MODES = {
-    "safe": {"risk_scale": 0.25, "max_bet_pct": 0.18, "label": "Safe"},
+    "safe": {"risk_scale": 1.0, "max_bet_pct": 0.05, "label": "Safe"},
     "aggressive": {"risk_scale": 0.50, "max_bet_pct": 0.30, "label": "Aggressive"},
     "degen": {"risk_scale": 1.00, "max_bet_pct": 0.45, "label": "Degen"},
 }
