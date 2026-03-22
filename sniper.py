@@ -212,8 +212,8 @@ class Sniper:
         bal = self._balance()
         stake = self._stake_usd(sig.confidence, entry_price)
 
-        if stake < 1.0 and bal >= 1.50:
-            stake = 1.0
+        if stake < 3.0 and bal >= 4.0:
+            stake = 3.0
 
         if stake <= 0:
             print(f"❌ skip: stake=0 (bal={bal:.2f}, conf={sig.confidence:.2f}, price={entry_price:.3f})")
