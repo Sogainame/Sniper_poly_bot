@@ -278,8 +278,8 @@ class Sniper:
         s = self.state
         if not s.fired or s.early_sold:
             return
-        # Wait for settlement
-        if time.time() - s.fire_ts < 10:
+        # Wait for GTC order to fill — needs time on Polymarket
+        if time.time() - s.fire_ts < 30:
             return
         if s.sell_attempts >= 3:
             return
@@ -294,10 +294,10 @@ class Sniper:
         if gain < self.asset.early_exit_profit:
             return
 
-        # V1: sell at best_bid
-        sell_price = round(cur_price, 2)
+        # Sell at best_bid, clamped to Polymarket max 0.99
+        sell_price = min(round(cur_price, 2), 0.99)
         if sell_price <= s.fire_price:
-            sell_price = round(cur_price - 0.01, 2)
+            sell_price = min(round(cur_price - 0.01, 2), 0.99)
 
         actual_gain = sell_price - s.fire_price
         profit = round(s.fire_shares * actual_gain * 0.98, 2)
@@ -332,7 +332,7 @@ class Sniper:
         if self.dry_run:
             return
 
-        time.sleep(3)  # wait for resolution to propagate
+        time.sleep(5)  # wait for resolution to propagate
 
         # Refresh balance allowance for conditional token
         self.client.update_balance_allowance(token_id)
@@ -340,6 +340,8 @@ class Sniper:
         sell_price = self.client.get_sell_price(token_id)
         if sell_price < 0.90:
             sell_price = 0.99  # fallback after resolution
+        # Polymarket max price is 0.99
+        sell_price = min(sell_price, 0.99)
 
         sell_id = self.client.submit_sell(
             token_id, sell_price, self.state.fire_shares,
