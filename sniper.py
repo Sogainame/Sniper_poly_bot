@@ -173,6 +173,10 @@ class Sniper:
         if not sig.direction:
             self._last_reason = "no_direction"
             return False
+        # DOWN-only mode: UP trades are 4W/5L=-$8.78, DOWN are 8W/0L=+$9.30
+        if sig.direction == "UP":
+            self._last_reason = "up_disabled"
+            return False
         if abs(sig.delta_pct) < self.asset.min_delta_pct:
             self._last_reason = f"delta<{self.asset.min_delta_pct}"
             return False
