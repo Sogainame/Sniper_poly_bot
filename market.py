@@ -329,9 +329,10 @@ class PolymarketClient:
                     price=round(price, 2),
                     size=round(size, 1),
                     side=BUY,
+                    fee_rate_bps=0,  # maker = 0 fee (required on fee-enabled markets)
                 )
                 signed = self.clob.create_order(args)
-                resp = self.clob.post_order(signed, OrderType.GTC)
+                resp = self.clob.post_order(signed, OrderType.GTC, post_only=True)
                 oid = resp.get("orderID") if isinstance(resp, dict) else None
                 print(f"[ORDER] MAKER BUY {label} @ {price:.2f} x {size:.0f}sh | ID: {oid or '?'}")
                 return oid
@@ -362,9 +363,10 @@ class PolymarketClient:
                     price=round(price, 2),
                     size=round(size, 1),
                     side=SELL,
+                    fee_rate_bps=0,  # maker = 0 fee
                 )
                 signed = self.clob.create_order(args)
-                resp = self.clob.post_order(signed, OrderType.GTC)
+                resp = self.clob.post_order(signed, OrderType.GTC, post_only=True)
                 oid = resp.get("orderID") if isinstance(resp, dict) else None
                 print(f"[SELL] {label} @ {price:.2f} x {size:.0f}sh | ID: {oid or '?'}")
                 return oid
@@ -386,3 +388,32 @@ class PolymarketClient:
             self.clob.update_balance_allowance(params)
         except Exception:
             pass
+
+    def get_token_balance(self, token_id: str) -> float:
+        """Get real conditional token balance (in shares, not raw units)."""
+        if self.clob is None or BalanceAllowanceParams is None or AssetType is None:
+            return 0.0
+        try:
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+            )
+            resp = self.clob.get_balance_allowance(params)
+            if isinstance(resp, dict):
+                raw = self._to_float(resp.get("balance", 0))
+                return raw / 1e6 if raw > 10_000 else raw
+        except Exception:
+            pass
+        return 0.0
+
+    def get_order_status(self, order_id: str) -> str:
+        """Poll order fill status. Returns: LIVE, MATCHED, FILLED, CANCELLED, or ''."""
+        if self.clob is None or not order_id:
+            return ""
+        try:
+            resp = self.clob.get_order(order_id)
+            if isinstance(resp, dict):
+                return str(resp.get("status", resp.get("order_status", ""))).upper()
+        except Exception:
+            pass
+        return ""

@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY") or os.getenv("PRIVATE_KEY")
-PROXY_WALLET = os.getenv("POLY_PROXY_WALLET") or os.getenv("PROXY_WALLET")
+PROXY_WALLET = os.getenv("POLY_FUNDER_ADDRESS") or os.getenv("POLY_PROXY_WALLET") or os.getenv("PROXY_WALLET")
 BUILDER_KEY = os.getenv("BUILDER_API_KEY") or os.getenv("BUILDER_KEY")
 BUILDER_SECRET = os.getenv("BUILDER_SECRET")
 BUILDER_PASSPHRASE = os.getenv("BUILDER_PASSPHRASE")
@@ -41,7 +41,7 @@ def main():
         HOST,
         key=PRIVATE_KEY,
         chain_id=CHAIN_ID,
-        signature_type=2,  # Safe
+        signature_type=1,  # Proxy (NOT 2/Safe — our wallet is Proxy)
         funder=PROXY_WALLET,
     )
     clob.set_api_creds(clob.create_or_derive_api_creds())

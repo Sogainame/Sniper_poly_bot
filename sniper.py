@@ -88,6 +88,8 @@ class Sniper:
         self.running = False
         self._last_heartbeat_ts = 0.0
         self._last_reason = ""
+        self._needs_redeem = False
+        self._windows_since_redeem = 0
         CSV_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── Timing ─────────────────────────────────────────────────────────────
@@ -227,7 +229,7 @@ class Sniper:
             print(f"[{a.name}] skip: Kelly no edge (conf={sig.confidence:.0%} price={buy_price:.2f})")
             return False
 
-        shares = max(bet / buy_price, 5)
+        shares = max(bet / buy_price, 6)  # min 6: fee eats ~0.01 → 4.99 < min sell 5
         cost = shares * buy_price
         roi = ((1.0 - buy_price) / buy_price) * 100
         sl = self._secs_left()
@@ -284,6 +286,12 @@ class Sniper:
         if s.sell_attempts >= 3:
             return
 
+        # Poll buy order fill status — don't sell what we don't own
+        if not self.dry_run and s.order_id:
+            status = self.client.get_order_status(s.order_id)
+            if status and status not in ("MATCHED", "FILLED"):
+                return  # buy order hasn't filled yet
+
         token = s.fire_token
         book = self.client.fetch_book(token)
         cur_price = book.best_bid
@@ -299,16 +307,27 @@ class Sniper:
         if sell_price <= s.fire_price:
             sell_price = min(round(cur_price - 0.01, 2), 0.99)
 
-        actual_gain = sell_price - s.fire_price
-        profit = round(s.fire_shares * actual_gain * 0.98, 2)
+        # Use real token balance, not fire_shares
+        if not self.dry_run:
+            self.client.update_balance_allowance(token)
+            time.sleep(1)
+            real_balance = self.client.get_token_balance(token)
+            sell_size = round(int(real_balance * 10) / 10, 1)
+            if sell_size < 5.0:
+                return  # not enough to sell
+        else:
+            sell_size = s.fire_shares
 
-        print(f"\n[{self.asset.name}] 💰 EARLY EXIT: sell @ {sell_price:.2f} "
+        actual_gain = sell_price - s.fire_price
+        profit = round(sell_size * actual_gain * 0.98, 2)
+
+        print(f"\n[{self.asset.name}] 💰 EARLY EXIT: sell {sell_size:.1f}sh @ {sell_price:.2f} "
               f"(bought {s.fire_price:.2f}) +${profit:.2f}")
 
         if not self.dry_run:
             s.sell_attempts += 1
             oid = self.client.submit_sell(
-                token, sell_price, s.fire_shares,
+                token, sell_price, sell_size,
                 f"{self.asset.name}-{s.fire_side}-EARLY"
             )
             if not oid:
@@ -327,7 +346,8 @@ class Sniper:
 
     def _auto_sell_winner(self, token_id: str) -> None:
         """After a WIN, sell tokens at $0.99 to recycle USDC back to balance.
-        Based on gengar_polymarket_bot approach.
+        Uses real token balance (not fire_shares) to avoid min-size rejection.
+        Falls back to redeem if sell fails.
         """
         if self.dry_run:
             return
@@ -336,21 +356,30 @@ class Sniper:
 
         # Refresh balance allowance for conditional token
         self.client.update_balance_allowance(token_id)
+        time.sleep(2)  # propagation delay — without this, sell gets 'not enough allowance'
+
+        # Get REAL token balance (fire_shares=5 but actual=4.99 after fee)
+        real_balance = self.client.get_token_balance(token_id)
+        sell_size = round(int(real_balance * 10) / 10, 1)  # floor to 0.1
+        if sell_size < 5.0:
+            print(f"[{self.asset.name}]    ⚠ Balance {real_balance:.2f} < min 5 — skip sell, will redeem")
+            self._needs_redeem = True
+            return
 
         sell_price = self.client.get_sell_price(token_id)
         if sell_price < 0.90:
             sell_price = 0.99  # fallback after resolution
-        # Polymarket max price is 0.99
         sell_price = min(sell_price, 0.99)
 
         sell_id = self.client.submit_sell(
-            token_id, sell_price, self.state.fire_shares,
+            token_id, sell_price, sell_size,
             f"{self.asset.name}-{self.state.fire_side}-CLAIM"
         )
         if sell_id:
-            print(f"[{self.asset.name}]    💰 Sold tokens → USDC recycled")
+            print(f"[{self.asset.name}]    💰 Sold {sell_size:.1f}sh @ ${sell_price:.2f} → USDC recycled")
         else:
-            print(f"[{self.asset.name}]    ⚠ Sell failed — check positions manually")
+            print(f"[{self.asset.name}]    ⚠ Sell failed — will redeem later")
+            self._needs_redeem = True
 
     # ── Result Resolution (V2 + V1 auto-sell) ─────────────────────────────
 
@@ -467,6 +496,23 @@ class Sniper:
                 writer.writeheader()
             writer.writerow(row)
 
+    # ── Redeem fallback (poly_web3 Builder relayer) ──────────────────────
+
+    def _try_redeem(self) -> None:
+        """Redeem all resolved positions via poly_web3. Fallback when sell fails."""
+        try:
+            from auto_redeem import main as redeem_main
+            print(f"[{self.asset.name}] 🔄 Running redeem...")
+            redeem_main()
+            self._needs_redeem = False
+            self._windows_since_redeem = 0
+        except SystemExit:
+            # auto_redeem.py calls sys.exit on missing env vars
+            print(f"[{self.asset.name}]    ⚠ Redeem skipped: missing Builder credentials in .env")
+            self._windows_since_redeem = 0
+        except Exception as e:
+            print(f"[{self.asset.name}]    ⚠ Redeem error: {e}")
+
     # ── V2 Main Loop (clean step() architecture) ──────────────────────────
 
     def step(self, now: float | None = None) -> None:
@@ -495,6 +541,12 @@ class Sniper:
                 else self.state.open_price or price
             )
             self._finalize_previous_window(prev_close)
+
+            # Redeem stuck positions if sell failed or every 10 windows
+            self._windows_since_redeem += 1
+            if not self.dry_run and (self._needs_redeem or self._windows_since_redeem >= 10):
+                self._try_redeem()
+
             self._reset_window(current_window, price)
 
         self.engine.add_tick(price, now_ts)
